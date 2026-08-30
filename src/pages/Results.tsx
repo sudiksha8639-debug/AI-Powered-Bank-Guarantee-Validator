@@ -7,6 +7,7 @@ import { api } from "@/convex/_generated/api";
 import { useQuery } from "convex/react";
 import type { FindingStatus, FindingCategory } from "@/lib/types";
 import { generateReport } from "@/lib/pdf-report";
+import { matchInstructionsToFindings } from "@/lib/instruction-matcher";
 import {
   Shield,
   ArrowLeft,
@@ -57,8 +58,19 @@ export default function Results() {
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [selectedFinding, setSelectedFinding] = useState<any>(null);
+  const [showFullValidation, setShowFullValidation] = useState(false);
+
+  // Instruction filtering
+  const instructionMatchIds = findings
+    ? matchInstructionsToFindings(validation?.userInstructions, findings)
+    : null;
+  const hasInstructions = instructionMatchIds !== null;
+  const showExpanded = showFullValidation || !hasInstructions;
 
   const filteredFindings = findings?.filter((f) => {
+    if (hasInstructions && !showExpanded && instructionMatchIds) {
+      if (!instructionMatchIds.includes(f._id)) return false;
+    }
     if (categoryFilter !== "all" && f.category !== categoryFilter) return false;
     if (statusFilter !== "all" && f.status !== statusFilter) return false;
     return true;
@@ -71,12 +83,14 @@ export default function Results() {
     }))
     .filter((g) => g.items.length > 0);
 
+  const visibleFindings = showExpanded ? findings : filteredFindings;
+
   const statusCounts = findings
     ? {
-        PASS: findings.filter((f) => f.status === "PASS").length,
-        REVIEW: findings.filter((f) => f.status === "REVIEW").length,
-        FAIL: findings.filter((f) => f.status === "FAIL").length,
-        INFO: findings.filter((f) => f.status === "INFO").length,
+        PASS: (visibleFindings || findings).filter((f) => f.status === "PASS").length,
+        REVIEW: (visibleFindings || findings).filter((f) => f.status === "REVIEW").length,
+        FAIL: (visibleFindings || findings).filter((f) => f.status === "FAIL").length,
+        INFO: (visibleFindings || findings).filter((f) => f.status === "INFO").length,
       }
     : null;
 
@@ -110,6 +124,17 @@ export default function Results() {
       validation.filename,
       format(validation.createdAt, "PPP"),
       validation.userInstructions || undefined,
+      // Pass filtered findings when instructions are active and not expanded
+      (hasInstructions && !showExpanded && filteredFindings) ? filteredFindings.map((f) => ({
+        id: f._id,
+        category: f.category,
+        checkId: f.checkId,
+        label: f.label,
+        status: f.status,
+        detail: f.detail,
+        pageNumber: f.pageNumber,
+        extractedText: f.extractedText,
+      })) : undefined,
     );
   };
 
@@ -200,10 +225,80 @@ export default function Results() {
           <div className="mb-5 rounded-xl border border-primary/20 bg-primary/[0.04] px-5 py-4">
             <div className="flex items-start gap-2.5">
               <Info className="h-4 w-4 text-primary mt-0.5 shrink-0" />
-              <div>
+              <div className="flex-1">
                 <p className="text-xs font-semibold uppercase tracking-wider text-primary">Additional Instructions</p>
                 <p className="mt-1 text-sm text-foreground/80">{validation.userInstructions}</p>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Instruction-specific verdict */}
+        {hasInstructions && !showExpanded && instructionMatchIds && findings && (
+          <div className="mb-5 rounded-xl border border-border/60 bg-card shadow-sm overflow-hidden">
+            <div className="px-6 py-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-[0.65rem] font-bold uppercase tracking-widest text-muted-foreground mb-1">Instruction-Specific Result</p>
+                  {(() => {
+                    const matched = findings.filter((f) => instructionMatchIds.includes(f._id));
+                    const failCount = matched.filter((f) => f.status === "FAIL").length;
+                    const reviewCount = matched.filter((f) => f.status === "REVIEW").length;
+                    if (failCount > 0) {
+                      return (
+                        <div className="flex items-center gap-2">
+                          <XCircle className="h-5 w-5 text-red-600" />
+                          <span className="text-base font-bold text-red-700">{failCount} issue(s) found matching your instructions</span>
+                        </div>
+                      );
+                    }
+                    if (reviewCount > 0) {
+                      return (
+                        <div className="flex items-center gap-2">
+                          <AlertTriangle className="h-5 w-5 text-amber-600" />
+                          <span className="text-base font-bold text-amber-700">{reviewCount} item(s) need review per your instructions</span>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+                        <span className="text-base font-bold text-emerald-700">All checks passed for your instructions</span>
+                      </div>
+                    );
+                  })()}
+                  <p className="mt-1 text-xs text-muted-foreground">{instructionMatchIds.length} finding(s) matched your validation instructions</p>
+                </div>
+                <Button
+                  onClick={() => setShowFullValidation(true)}
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 rounded-lg shrink-0"
+                >
+                  <ArrowRight className="h-3.5 w-3.5" />
+                  Validate Full BG
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Full validation expanded notice */}
+        {hasInstructions && showExpanded && (
+          <div className="mb-5 rounded-xl border border-primary/20 bg-primary/[0.04] px-5 py-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Info className="h-4 w-4 text-primary" />
+                <span className="text-sm font-medium text-primary">Showing full validation results for all {findings?.length || 0} checks</span>
+              </div>
+              <Button
+                onClick={() => setShowFullValidation(false)}
+                variant="ghost"
+                size="sm"
+                className="gap-1.5 rounded-lg text-xs text-primary hover:text-primary/80"
+              >
+                Back to instruction results
+              </Button>
             </div>
           </div>
         )}

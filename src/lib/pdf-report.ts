@@ -156,6 +156,7 @@ export function generateReport(
   templateName: string,
   date: string,
   userInstructions?: string,
+  filteredFindings?: Finding[],
 ) {
   const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
   const pageW = doc.internal.pageSize.getWidth();
@@ -163,6 +164,13 @@ export function generateReport(
   const margin = 20;
   const contentW = pageW - margin * 2;
   let y = 0;
+
+  // Compute filtered counts when applicable
+  const reportFindings = filteredFindings || result.findings;
+  const reportPass = reportFindings.filter((f) => f.status === "PASS").length;
+  const reportReview = reportFindings.filter((f) => f.status === "REVIEW").length;
+  const reportFail = reportFindings.filter((f) => f.status === "FAIL").length;
+  const reportInfo = reportFindings.filter((f) => f.status === "INFO").length;
 
   /* ─── Helpers ─── */
   const ensureSpace = (needed: number) => {
@@ -415,6 +423,13 @@ export function generateReport(
         ? STATUS_COLORS.FAIL
         : STATUS_COLORS.REVIEW;
 
+  // Use filtered counts if filtering is active
+  const useFiltered = !!filteredFindings;
+  const pCount = useFiltered ? reportPass : result.passCount;
+  const rCount = useFiltered ? reportReview : result.reviewCount;
+  const fCount = useFiltered ? reportFail : result.failCount;
+  const iCount = useFiltered ? reportInfo : result.infoCount;
+
   const verdictLabel =
     result.status === "VALID"
       ? "VALIDATION PASSED"
@@ -458,10 +473,10 @@ export function generateReport(
   ensureSpace(26);
   const cardW = contentW / 4 - 2;
   const cards: { label: string; count: number; sub: string; color: [number, number, number]; bg: [number, number, number] }[] = [
-    { label: "PASS", count: result.passCount, sub: "Requirements met", color: STATUS_COLORS.PASS, bg: STATUS_BG.PASS },
-    { label: "REVIEW", count: result.reviewCount, sub: "Manual verification", color: STATUS_COLORS.REVIEW, bg: STATUS_BG.REVIEW },
-    { label: "FAIL", count: result.failCount, sub: "Discrepancies found", color: STATUS_COLORS.FAIL, bg: STATUS_BG.FAIL },
-    { label: "INFO", count: result.infoCount, sub: "Additional findings", color: STATUS_COLORS.INFO, bg: STATUS_BG.INFO },
+    { label: "PASS", count: pCount, sub: "Requirements met", color: STATUS_COLORS.PASS, bg: STATUS_BG.PASS },
+    { label: "REVIEW", count: rCount, sub: "Manual verification", color: STATUS_COLORS.REVIEW, bg: STATUS_BG.REVIEW },
+    { label: "FAIL", count: fCount, sub: "Discrepancies found", color: STATUS_COLORS.FAIL, bg: STATUS_BG.FAIL },
+    { label: "INFO", count: iCount, sub: "Additional findings", color: STATUS_COLORS.INFO, bg: STATUS_BG.INFO },
   ];
 
   cards.forEach((card, i) => {
@@ -485,7 +500,7 @@ export function generateReport(
   y += 28;
 
   /* ─── ATTENTION REQUIRED ─── */
-  const issueItems = result.findings.filter((f) => f.status === "REVIEW" || f.status === "FAIL");
+  const issueItems = reportFindings.filter((f) => f.status === "REVIEW" || f.status === "FAIL");
 
   if (issueItems.length > 0) {
     drawSectionHeading("ATTENTION REQUIRED");
@@ -537,7 +552,7 @@ export function generateReport(
   drawSectionHeading("VALIDATION RESULTS");
 
   CATEGORIES.forEach((cat) => {
-    const catFindings = result.findings.filter((f) => f.category === cat);
+    const catFindings = reportFindings.filter((f) => f.category === cat);
     if (catFindings.length === 0) return;
 
     ensureSpace(20);
