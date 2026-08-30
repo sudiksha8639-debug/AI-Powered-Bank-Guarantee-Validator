@@ -5,1360 +5,1184 @@ import type {
   ValidationResult,
 } from "./types";
 
-/* ──────────────────────────────────────────────────────────────
-   HELPERS
-   ────────────────────────────────────────────────────────────── */
+/* ================================================================
+   1. NORMALIZATION — exact notebook v_norm / v_match / compact
+   ================================================================ */
 
-/** Normalize text for comparison: lowercase, collapse whitespace, strip punctuation */
-function normalize(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function v_norm(text: string): string {
+  let t = String(text || "");
+  t = t.replace(/\xa0/g, " ");
+  t = t.replace(/\u2018/g, "'").replace(/\u2019/g, "'");
+  t = t.replace(/\u201c/g, '"').replace(/\u201d/g, '"');
+  t = t.replace(/—/g, "-").replace(/–/g, "-");
+  t = t.replace(/'/g, "'");
+  t = t.replace(/\s+/g, " ");
+  return t.trim();
 }
 
-/** Bigram-based similarity ratio (0–1). */
-function similarity(a: string, b: string): number {
-  if (a === b) return 1;
+function v_match(text: string): string {
+  let t = v_norm(text).toLowerCase();
+  t = t.replace(/&/g, " and ");
+  t = t.replace(/\//g, " / ");
+  t = t.replace(/[^a-z0-9₹.,:/\- ]+/g, " ");
+  t = t.replace(/\s+/g, " ");
+  return t.trim();
+}
+
+function compact(text: string): string {
+  return v_match(text).replace(/[^a-z0-9]/g, "");
+}
+
+/* ================================================================
+   2. FUZZY MATCHING — rapidfuzz-equivalent scoring
+   ================================================================ */
+
+/** token_set_ratio: compare sorted unique token sets */
+function tokenSetRatio(a: string, b: string): number {
+  const sa = new Set(a.split(" ").filter(Boolean));
+  const sb = new Set(b.split(" ").filter(Boolean));
+  if (sa.size === 0 && sb.size === 0) return 100;
+
+  const inter = new Set([...sa].filter((w) => sb.has(w)));
+  const sortedInter = [...inter].sort().join(" ");
+  const sortedA = [...sa].sort().join(" ");
+  const sortedB = [...sb].sort().join(" ");
+
+  if (sortedInter === sortedA && sortedInter === sortedB) return 100;
+
+  const diff_a = [...sa].filter((w) => !sb.has(w)).sort().join(" ");
+  const diff_b = [...sb].filter((w) => !sa.has(w)).sort().join(" ");
+
+  const set1 = sortedInter + (diff_a ? " " + diff_a : "");
+  const set2 = sortedInter + (diff_b ? " " + diff_b : "");
+  const set3 = diff_a || "";
+
+  return Math.max(
+    levenshteinRatio(sortedInter, set1),
+    levenshteinRatio(sortedInter, set2),
+    levenshteinRatio(set1, set2),
+    levenshteinRatio(sortedInter, set3 || "x"),
+  );
+}
+
+/** partial_ratio: best substring match (sliding window) */
+function partialRatio(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  if (shorter.length === 0) return 0;
+  const words = longer.split(" ");
+  const shortWords = shorter.split(" ");
+  const window = Math.max(12, shortWords.length + 10);
+  let best = 0;
+  for (let i = 0; i < words.length; i += 4) {
+    const chunk = words.slice(i, i + window).join(" ");
+    const score = tokenSetRatio(shorter, chunk);
+    if (score > best) best = score;
+  }
+  // Also try direct levenshtein on substrings
+  const levScore = levenshteinRatio(shorter, longer);
+  return Math.max(best, levScore);
+}
+
+/** Levenshtein-based ratio between two strings */
+function levenshteinRatio(a: string, b: string): number {
+  if (a === b) return 100;
   if (a.length === 0 || b.length === 0) return 0;
-  const na = normalize(a);
-  const nb = normalize(b);
-  if (na === nb) return 1;
+  const al = a.length;
+  const bl = b.length;
+  const maxLen = Math.max(al, bl);
+  // For long strings, use bigram similarity as approximation
+  if (maxLen > 500) return bigramRatio(a, b);
+  const dp: number[][] = Array.from({ length: al + 1 }, () => new Array(bl + 1).fill(0));
+  for (let i = 0; i <= al; i++) dp[i][0] = i;
+  for (let j = 0; j <= bl; j++) dp[0][j] = j;
+  for (let i = 1; i <= al; i++) {
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return ((maxLen - dp[al][bl]) / maxLen) * 100;
+}
 
-  const bigrams = (s: string) => {
-    const set = new Set<string>();
-    for (let i = 0; i < s.length - 1; i++) set.add(s.substring(i, i + 2));
-    return set;
+/** Bigram-based ratio for long strings */
+function bigramRatio(a: string, b: string): number {
+  const getBigrams = (s: string): Map<string, number> => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < s.length - 1; i++) {
+      const bg = s.substring(i, i + 2);
+      map.set(bg, (map.get(bg) || 0) + 1);
+    }
+    return map;
   };
-  const ba = bigrams(na);
-  const bb = bigrams(nb);
-  let intersection = 0;
-  for (const b of ba) {
-    if (bb.has(b)) intersection++;
+  const ba = getBigrams(a);
+  const bb = getBigrams(b);
+  let inter = 0;
+  for (const [k, v] of ba) {
+    const bv = bb.get(k) || 0;
+    inter += Math.min(v, bv);
   }
-  return (2 * intersection) / (ba.size + bb.size);
+  const totalA = [...ba.values()].reduce((s, v) => s + v, 0);
+  const totalB = [...bb.values()].reduce((s, v) => s + v, 0);
+  if (totalA === 0 || totalB === 0) return 0;
+  return (2 * inter) / (totalA + totalB) * 100;
 }
 
-/** Fuzzy word overlap ratio between two strings */
-function wordOverlap(a: string, b: string): number {
-  const wordsA = new Set(normalize(a).split(" ").filter((w) => w.length > 2));
-  const wordsB = new Set(normalize(b).split(" ").filter((w) => w.length > 2));
-  if (wordsA.size === 0 || wordsB.size === 0) return 0;
-  let intersection = 0;
-  for (const w of wordsA) {
-    if (wordsB.has(w)) intersection++;
-  }
-  return intersection / Math.min(wordsA.size, wordsB.size);
+/* ================================================================
+   3. PAGE HANDLING
+   ================================================================ */
+
+interface PageText {
+  page: number;
+  text: string;
 }
 
-/** Find first regex match group */
-function extractField(text: string, patterns: RegExp[]): string | null {
-  for (const p of patterns) {
-    const m = text.match(p);
-    if (m && m[1]) return m[1].trim();
+function getPageTexts(
+  pages: { pageNumber: number; text: string }[],
+): PageText[] {
+  return pages.map((p, i) => ({
+    page: p.pageNumber || i + 1,
+    text: v_norm(p.text),
+  }));
+}
+
+/* ================================================================
+   4. RESULT HELPER
+   ================================================================ */
+
+function addFinding(
+  findings: ValidationFinding[],
+  idx: { current: number },
+  category: FindingCategory,
+  checkId: string,
+  label: string,
+  status: ValidationFinding["status"],
+  detail: string,
+  pageNumber?: number,
+  extractedText?: string,
+  similarity?: number,
+) {
+  idx.current++;
+  findings.push({
+    id: `f_${idx.current}`,
+    category,
+    checkId,
+    label,
+    status,
+    detail,
+    pageNumber,
+    extractedText,
+  });
+}
+
+/* ================================================================
+   5. CANONICAL CLAUSES & ANCHORS (from notebook)
+   ================================================================ */
+
+const CANONICAL_STARTS: [string, string][] = [
+  ["C1", "We hereby undertake to give the irrevocable"],
+  ["C2", "You will have the full liberty"],
+  ["C3", "Your right to recover"],
+  ["C4", "The guarantee herein contained"],
+  ["C5", "The bank undertakes not to revoke"],
+  ["C6", "Bank also agrees"],
+  ["C7", "The amount under the Bank Guarantee"],
+  ["C8", "Therefore, we hereby affirm"],
+  ["C9", "We have power to issue this guarantee"],
+  ["C10", "Notwithstanding anything contained herein"],
+];
+
+const CLAUSE_ANCHORS: Record<string, string[]> = {
+  C1: [
+    "we hereby undertake to give the irrevocable",
+    "hereby undertake to give the irrevocable",
+    "undertake to give the irrevocable",
+  ],
+  C2: ["you will have the full liberty", "will have the full liberty"],
+  C3: ["your right to recover", "right to recover the said sum"],
+  C4: [
+    "the guarantee herein contained",
+    "guarantee herein contained shall not be",
+  ],
+  C5: ["the bank undertakes not to revoke", "bank undertakes not to revoke"],
+  C6: ["bank also agrees", "also agrees that gail"],
+  C7: [
+    "the amount under the bank guarantee",
+    "amount under the bank guarantee",
+  ],
+  C8: [
+    "therefore we hereby affirm",
+    "therefore we hereby affirm that",
+    "we hereby affirm that we are guarantors",
+  ],
+  C9: [
+    "we have power to issue this guarantee",
+    "have power to issue this guarantee",
+    "power to issue this guarantee",
+  ],
+  C10: [
+    "notwithstanding anything contained herein",
+    "notwithstanding anything contained hereinabove",
+  ],
+};
+
+/* ================================================================
+   6. CLAUSE LOCATION — anchor-first matching (notebook cell 6)
+   ================================================================ */
+
+function findClauseLocation(
+  clauseId: string,
+  _clauseText: string,
+  pages: PageText[],
+): { score: number; page: number | null; evidence: string; anchor: string | null } {
+  const anchors = CLAUSE_ANCHORS[clauseId] || [];
+  let best = { score: 0, page: null as number | null, evidence: "", anchor: null as string | null };
+
+  for (const p of pages) {
+    const pageText = v_norm(p.text);
+    const pageMatch = v_match(p.text);
+    if (!pageMatch) continue;
+
+    // A. Exact/near-exact anchor search
+    for (const anchor of anchors) {
+      const anchorM = v_match(anchor);
+      const pos = pageMatch.indexOf(anchorM);
+      if (pos >= 0) {
+        const start = Math.max(0, pos - 120);
+        const end = Math.min(pageText.length, pos + 700);
+        const evidence = pageText.substring(start, end);
+        const score = 98.0;
+        if (score > best.score) {
+          best = { score, page: p.page, evidence, anchor };
+        }
+      }
+    }
+
+    // B. Fuzzy anchor matching
+    for (const anchor of anchors) {
+      const anchorM = v_match(anchor);
+      const words = pageMatch.split(" ");
+      if (!words.length) continue;
+      const anchorWords = anchorM.split(" ");
+      const windowSize = Math.max(12, anchorWords.length + 10);
+
+      for (let i = 0; i < words.length; i += 4) {
+        const chunk = words.slice(i, i + windowSize).join(" ");
+        if (!chunk) continue;
+        const score = tokenSetRatio(anchorM, chunk);
+        if (score > best.score) {
+          best = { score: score, page: p.page, evidence: chunk, anchor };
+        }
+      }
+    }
   }
+
+  return best;
+}
+
+/* ================================================================
+   7. CLAUSE VALIDATION — 3-tier scoring (notebook cell 7)
+   ================================================================ */
+
+function validateClause(
+  definition: { id: string; title: string; text: string },
+  pages: PageText[],
+): { status: "PASS" | "REVIEW"; page: number | null; evidence: string; similarity: number; detail: string } {
+  const match = findClauseLocation(definition.id, definition.text, pages);
+  const { score, page, evidence } = match;
+
+  if (score >= 96) {
+    return {
+      status: "PASS",
+      page,
+      evidence,
+      similarity: score,
+      detail: `Required clause detected with strong anchor evidence (${score.toFixed(1)}%).`,
+    };
+  }
+  if (score >= 82) {
+    return {
+      status: "PASS",
+      page,
+      evidence,
+      similarity: score,
+      detail: `Clause appears present despite OCR/wording variation (${score.toFixed(1)}% confidence).`,
+    };
+  }
+  if (score >= 60) {
+    return {
+      status: "REVIEW",
+      page,
+      evidence,
+      similarity: score,
+      detail: `Clause evidence was detected, but OCR or wording differs from the template (${score.toFixed(1)}% confidence). Manual verification is recommended.`,
+    };
+  }
+  return {
+    status: "REVIEW",
+    page,
+    evidence,
+    similarity: score,
+    detail: "Required clause could not be confidently matched. Manual verification is recommended.",
+  };
+}
+
+/* ================================================================
+   8. AMOUNT EXTRACTION & CONSISTENCY (notebook cell 8)
+   ================================================================ */
+
+const ONES: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+};
+
+const TENS: Record<string, number> = {
+  twenty: 20, thirty: 30, forty: 40, fifty: 50,
+  sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+
+const SCALES: Record<string, number> = {
+  hundred: 100, thousand: 1000, lakh: 100000, lakhs: 100000,
+  crore: 10000000, crores: 10000000,
+};
+
+function wordsToNumber(text: string): number | null {
+  let t = v_match(text);
+  t = t.replace(/\b(?:rupees?|rs|inr|only|and|paise|paisa)\b/g, " ");
+  const tokens = t.split(" ").filter(Boolean);
+  if (!tokens.length) return null;
+
+  let total = 0;
+  let current = 0;
+  let found = false;
+
+  for (const token of tokens) {
+    if (token in ONES) { current += ONES[token]; found = true; }
+    else if (token in TENS) { current += TENS[token]; found = true; }
+    else if (token === "hundred") { if (current === 0) current = 1; current *= 100; found = true; }
+    else if (token in SCALES) {
+      const scale = SCALES[token];
+      if (current === 0) current = 1;
+      total += current * scale;
+      current = 0;
+      found = true;
+    }
+  }
+  if (!found) return null;
+  return total + current;
+}
+
+function extractAmountFigures(text: string): number[] {
+  const patterns = [
+    /(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.\d{1,2})?)/gi,
+    /(?:bg\s+amount|guarantee\s+amount|amount)\s*(?:is|of|:|-)?\s*(?:₹|rs\.?|inr)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)/gi,
+  ];
+  const values: number[] = [];
+  for (const pattern of patterns) {
+    let m;
+    const re = new RegExp(pattern.source, pattern.flags);
+    while ((m = re.exec(text)) !== null) {
+      try {
+        const value = parseFloat(m[1].replace(/,/g, ""));
+        if (value >= 1000) values.push(value);
+      } catch { /* skip */ }
+    }
+  }
+  return [...new Map(values.map((v) => [v, v])).values()];
+}
+
+function extractAmountWords(text: string): number[] {
+  const candidates: number[] = [];
+  const patterns = [
+    /(?:₹|rs\.?|inr)\s*[0-9][0-9,]*(?:\.\d+)?\s*(?:\/-|\/|-)?\s*\(\s*(?:rupees?)\s+([a-z\s-]{5,160})/gi,
+    /\(\s*(?:rupees?)\s+([a-z\s-]{5,160})/gi,
+  ];
+  for (const pattern of patterns) {
+    let m;
+    const re = new RegExp(pattern.source, pattern.flags);
+    while ((m = re.exec(text)) !== null) {
+      let phrase = m[1];
+      phrase = phrase.split(/\b(?:only|being|as\s+full|from\s+us|from\s+time|and\s+we|or\s+such)\b/)[0];
+      const value = wordsToNumber(phrase);
+      if (value !== null && value >= 1000) candidates.push(value);
+    }
+  }
+  return [...new Map(candidates.map((v) => [v, v])).values()];
+}
+
+function checkAmountConsistency(text: string): ["PASS" | "REVIEW" | "FAIL", string] {
+  const figures = extractAmountFigures(text);
+  const words = extractAmountWords(text);
+
+  if (!figures.length && !words.length) {
+    return ["REVIEW", "No reliable guarantee amount could be identified."];
+  }
+  if (!figures.length) {
+    return ["REVIEW", "Amount in words was detected, but a corresponding numeric amount could not be reliably identified."];
+  }
+  if (!words.length) {
+    return ["REVIEW", "Numeric guarantee amount was detected, but a corresponding amount-in-words expression could not be reliably identified."];
+  }
+
+  const figureSet = new Set(figures.map((x) => Math.round(x * 100) / 100));
+  const wordSet = new Set(words.map((x) => Math.round(x * 100) / 100));
+
+  for (const v of figureSet) {
+    if (wordSet.has(v)) {
+      return ["PASS", `Amount in words and figures match: ₹${v.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`];
+    }
+  }
+
+  // Dominant amount check
+  const counter = new Map<number, number>();
+  for (const v of figures) {
+    const r = Math.round(v * 100) / 100;
+    counter.set(r, (counter.get(r) || 0) + 1);
+  }
+  let dominant: number | null = null;
+  let maxCount = 0;
+  for (const [v, c] of counter) {
+    if (c > maxCount) { maxCount = c; dominant = v; }
+  }
+  if (dominant !== null) {
+    const closest = words.reduce((a, b) => Math.abs(b - dominant!) < Math.abs(a - dominant!) ? b : a);
+    if (Math.abs(closest - dominant) <= 1) {
+      return ["PASS", `Amount in words and figures match after normalization: ₹${dominant.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`];
+    }
+  }
+
+  return [
+    "FAIL",
+    `Amount in words and figures do not match. Figures: ${figures.map((x) => "₹" + x.toLocaleString("en-IN", { minimumFractionDigits: 2 })).join(", ")} | Words: ${words.map((x) => "₹" + Math.round(x).toLocaleString("en-IN")).join(", ")}`,
+  ];
+}
+
+/* ================================================================
+   9. LABELED DATE EXTRACTION (notebook cell 9)
+   ================================================================ */
+
+function parseDateValue(value: string): Date | null {
+  try {
+    // Try DD/MM/YYYY or DD.MM.YYYY
+    const parts = value.split(/[.\/-]/);
+    if (parts.length === 3) {
+      const day = parseInt(parts[0]);
+      const month = parseInt(parts[1]);
+      let year = parseInt(parts[2]);
+      if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+      if (year < 100) year += 2000;
+      const d = new Date(year, month - 1, day);
+      if (d.getFullYear() === year && d.getMonth() === month - 1 && d.getDate() === day) return d;
+    }
+    // Try "DD Month YYYY"
+    const altMatch = value.match(/(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})/);
+    if (altMatch) {
+      const months = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+      const mi = months.indexOf(altMatch[2].toLowerCase());
+      if (mi >= 0) {
+        return new Date(parseInt(altMatch[3]), mi, parseInt(altMatch[1]));
+      }
+    }
+  } catch { /* skip */ }
   return null;
 }
 
-/** Check if a phrase/word exists in text (case-insensitive) */
-function hasPhrase(text: string, phrase: string): boolean {
-  return text.toLowerCase().includes(phrase.toLowerCase());
+function extractLabeledDates(text: string): { issue: Date[]; expiry: Date[]; claim_expiry: Date[] } {
+  const result: { issue: Date[]; expiry: Date[]; claim_expiry: Date[] } = { issue: [], expiry: [], claim_expiry: [] };
+
+  // Issue / execution date
+  const issuePatterns = [
+    /(?:date\s+of\s+issue|issue\s+date|issued\s+on|certificate\s+issue\s+date|dated)\D{0,80}(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4})/gi,
+    /(?:date\s+of\s+issue|issue\s+date|issued\s+on|certificate\s+issue\s+date|dated)\D{0,80}(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})/gi,
+  ];
+  for (const pattern of issuePatterns) {
+    let m;
+    const re = new RegExp(pattern.source, pattern.flags);
+    while ((m = re.exec(text)) !== null) {
+      const d = parseDateValue(m[1]);
+      if (d) result.issue.push(d);
+    }
+  }
+
+  // Claim expiry (check BEFORE general expiry)
+  const claimPatterns = [
+    /(?:bg\s+claim\s+expiry\s+date|claim\s+expiry\s+date|claim\s+expiry|claim\s+period)\D{0,100}(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4})/gi,
+    /(?:bg\s+claim\s+expiry\s+date|claim\s+expiry\s+date|claim\s+expiry|claim\s+period)\D{0,100}(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})/gi,
+  ];
+  for (const pattern of claimPatterns) {
+    let m;
+    const re = new RegExp(pattern.source, pattern.flags);
+    while ((m = re.exec(text)) !== null) {
+      const d = parseDateValue(m[1]);
+      if (d) result.claim_expiry.push(d);
+    }
+  }
+
+  // General BG expiry
+  const expiryPatterns = [
+    /(?:bg\s+expiry\s+date|expiry\s+date|guarantee\s+expiry|valid\s+up\s+to|valid\s+till|valid\s+until)\D{0,100}(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{2,4})/gi,
+    /(?:bg\s+expiry\s+date|expiry\s+date|guarantee\s+expiry|valid\s+up\s+to|valid\s+till|valid\s+until)\D{0,100}(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})/gi,
+  ];
+  for (const pattern of expiryPatterns) {
+    let m;
+    const re = new RegExp(pattern.source, pattern.flags);
+    while ((m = re.exec(text)) !== null) {
+      const d = parseDateValue(m[1]);
+      if (d) result.expiry.push(d);
+    }
+  }
+
+  // Deduplicate
+  for (const key of ["issue", "expiry", "claim_expiry"] as const) {
+    result[key] = [...new Map(result[key].map((d) => [d.getTime(), d])).values()];
+  }
+
+  return result;
 }
 
-/** Find all regex matches */
-function findAllMatches(text: string, pattern: RegExp): string[] {
-  const matches: string[] = [];
+function addMonths(date: Date, months: number): Date {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
+function checkDateLogic(text: string): ["PASS" | "REVIEW" | "FAIL", string] {
+  const dates = extractLabeledDates(text);
+  const issue = dates.issue[0] || null;
+  const expiry = dates.expiry[0] || null;
+  const claim = dates.claim_expiry[0] || null;
+
+  if (expiry && claim) {
+    if (claim < expiry) {
+      return ["FAIL", `Claim-expiry date ${claim.toISOString().slice(0, 10)} occurs before BG expiry date ${expiry.toISOString().slice(0, 10)}.`];
+    }
+    const required = addMonths(expiry, 3);
+    if (claim >= required) {
+      if (issue && issue > expiry) {
+        return ["FAIL", `Issue date ${issue.toISOString().slice(0, 10)} occurs after expiry date ${expiry.toISOString().slice(0, 10)}.`];
+      }
+      return ["PASS", `Expiry=${expiry.toISOString().slice(0, 10)} | Claim=${claim.toISOString().slice(0, 10)} | Claim period ≥ 3 months.`];
+    }
+    return [`FAIL`, `Claim expiry ${claim.toISOString().slice(0, 10)} is less than 3 months after BG expiry ${expiry.toISOString().slice(0, 10)}. Required at least ${required.toISOString().slice(0, 10)}.`];
+  }
+
+  if (expiry && !claim) {
+    if (issue && issue > expiry) {
+      return ["FAIL", `Issue date ${issue.toISOString().slice(0, 10)} occurs after expiry date ${expiry.toISOString().slice(0, 10)}.`];
+    }
+    return ["REVIEW", `BG expiry date detected as ${expiry.toISOString().slice(0, 10)}, but a clearly labeled claim-expiry date could not be reliably identified.`];
+  }
+
+  return ["REVIEW", "No sufficiently reliable labeled BG expiry/claim date relationship could be established."];
+}
+
+/* ================================================================
+   10. BG NUMBER (notebook cell 10)
+   ================================================================ */
+
+function extractBgNumbers(text: string): string[] {
+  const pattern = /(?:bank\s+guarantee|bg)\s*(?:no\.?|number)\s*[:.\-]?\s*([A-Z0-9][A-Z0-9./\-]{4,})/gi;
+  const values: string[] = [];
   let m;
   while ((m = pattern.exec(text)) !== null) {
-    if (m[1]) matches.push(m[1].trim());
+    const val = v_norm(m[1]).toUpperCase();
+    if (val.length >= 6) values.push(val);
   }
-  return matches;
+  return [...new Set(values)];
 }
 
-/* ──────────────────────────────────────────────────────────────
-   MAIN VALIDATION ENGINE
-   ────────────────────────────────────────────────────────────── */
+function checkBgNumber(text: string): ["PASS" | "REVIEW" | "FAIL", string] {
+  const values = extractBgNumbers(text);
+  if (!values.length) return ["REVIEW", "No reliable Bank Guarantee number was detected."];
+  if (values.length === 1) return ["PASS", `BG number is consistent: ${values[0]}`];
+
+  const compactValues = values.map(compact);
+  for (let i = 0; i < compactValues.length; i++) {
+    for (let j = 0; j < compactValues.length; j++) {
+      if (i !== j && (compactValues[i].includes(compactValues[j]) || compactValues[j].includes(compactValues[i]))) {
+        return ["REVIEW", "Multiple closely related BG-number readings were detected; verify visually."];
+      }
+    }
+  }
+  return ["FAIL", "Multiple different BG numbers detected: " + values.join(", ")];
+}
+
+/* ================================================================
+   11. CONTRACT / PO / FOA / LOA (notebook cell 11)
+   ================================================================ */
+
+function extractReferences(text: string): string[] {
+  const pattern = /(?:FOA|LOA|PO|P\.O\.|purchase\s+order|contract)\s*(?:no\.?|number)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9./&\-]{6,})/gi;
+  const values: string[] = [];
+  const blacklist = new Set(["conditions", "performance", "responsibility", "responsible", "stpone", "stponement", "rated", "nsibility"]);
+
+  let m;
+  while ((m = pattern.exec(text)) !== null) {
+    const val = v_norm(m[1]).toUpperCase();
+    if (val.length < 7) continue;
+    if (blacklist.has(val.toLowerCase())) continue;
+    if (!/\d/.test(val)) continue;
+    values.push(val);
+  }
+  return [...new Set(values)];
+}
+
+function checkReference(text: string): ["PASS" | "REVIEW", string] {
+  const values = extractReferences(text);
+  if (!values.length) return ["REVIEW", "No reliable PO / LOA / FOA / contract reference was detected."];
+  if (values.length === 1) return ["PASS", `Contract / purchase-order reference detected: ${values[0]}`];
+
+  const compactValues = values.map(compact);
+  for (let i = 0; i < compactValues.length; i++) {
+    for (let j = i + 1; j < compactValues.length; j++) {
+      if (compactValues[i].includes(compactValues[j]) || compactValues[j].includes(compactValues[i])) {
+        return ["REVIEW", "Related contract/reference readings were detected. Manual verification recommended."];
+      }
+    }
+  }
+  return ["REVIEW", "Multiple contract/reference values were detected: " + values.join(", ")];
+}
+
+/* ================================================================
+   12. BENEFICIARY (notebook cell 12)
+   ================================================================ */
+
+function extractExpectedBeneficiary(templateText: string): string | null {
+  const patterns = [
+    /(?:in\s+favour\s+of|in\s+favor\s+of|beneficiary)\s*[:\-]?\s*([A-Z][A-Za-z0-9&.,()\- ]{3,100})/gi,
+  ];
+  for (const pattern of patterns) {
+    let m;
+    while ((m = pattern.exec(templateText)) !== null) {
+      let value = v_norm(m[1]);
+      value = value.split(/\b(?:hereinafter|having|through|which|under|for\s+the)\b/)[0].trim();
+      if (value.split(" ").length >= 2) return value;
+    }
+  }
+  const fallback = templateText.match(/(gail\s*\(?india\)?\s+limited)/i);
+  if (fallback) return v_norm(fallback[1]);
+  return null;
+}
+
+function checkBeneficiary(templateText: string, text: string): ["PASS" | "REVIEW" | "FAIL", string] {
+  const expected = extractExpectedBeneficiary(templateText);
+  if (!expected) return ["PASS", "No specific beneficiary identity could be reliably extracted from the template."];
+
+  const expectedM = v_match(expected);
+  const textM = v_match(text);
+  const score = partialRatio(expectedM, textM);
+
+  if (score >= 90) return ["PASS", `Beneficiary matches template: ${expected}`];
+  if (score >= 70) return ["REVIEW", `Beneficiary appears consistent with template (${score.toFixed(1)}% confidence): ${expected}`];
+  return ["FAIL", `Expected beneficiary '${expected}' was not reliably confirmed in the BG.`];
+}
+
+/* ================================================================
+   13. SIGNATURE / AUTHORIZATION (notebook cell 13)
+   ================================================================ */
+
+function checkSignature(text: string): ["PASS" | "REVIEW", string, string] {
+  const patterns = [
+    /\bauthori[sz]ed\s+signatory\b/i,
+    /\bauthori[sz]ed\s+signature\b/i,
+    /\bauthori[sz]ed\s+signing\b/i,
+    /\bsignature\s+of\b/i,
+    /\bsignature\b/i,
+    /\bsigned\b/i,
+    /\bdigitally\s+signed\b/i,
+    /\bpower\s+of\s+attorney\b/i,
+    /\bfor\s+and\s+on\s+behalf\s+of\b/i,
+    /\bbranch\s+manager\b/i,
+  ];
+  for (const pattern of patterns) {
+    const m = text.match(pattern);
+    if (m && m.index !== undefined) {
+      const start = Math.max(0, m.index - 100);
+      const end = Math.min(text.length, m.index + m[0].length + 180);
+      return ["PASS", "Signature / authorization evidence detected.", text.substring(start, end)];
+    }
+  }
+  return ["REVIEW", "No reliable textual signature/authorization evidence was detected. Visual verification may be required.", ""];
+}
+
+/* ================================================================
+   14. STAMP / E-STAMP (notebook cell 14)
+   ================================================================ */
+
+function templateRequiresStamp(templateText: string): boolean {
+  return /\b(?:stamp|e-?stamp|non[- ]?judicial|stamp\s+paper)\b/i.test(templateText);
+}
+
+function checkStamp(text: string, templateText: string): ["PASS" | "REVIEW", string, string] {
+  if (!templateRequiresStamp(templateText)) {
+    return ["PASS", "Stamp/e-stamp is not identified as a mandatory requirement in the uploaded template.", ""];
+  }
+  const pattern = /\b(?:e-?stamp|stamp\s+duty|non[- ]?judicial|certificate\s+no|serial\s+no|IN-[A-Z0-9]{6,})\b/i;
+  const m = text.match(pattern);
+  if (m && m.index !== undefined) {
+    const start = Math.max(0, m.index - 100);
+    const end = Math.min(text.length, m.index + m[0].length + 200);
+    return ["PASS", "Required stamp/e-stamp evidence detected.", text.substring(start, end)];
+  }
+  return ["REVIEW", "The template refers to stamp requirements, but reliable textual stamp/e-stamp evidence was not detected. Visually verify the BG.", ""];
+}
+
+/* ================================================================
+   15. CONCEPT CHECKS (notebook cell 15)
+   ================================================================ */
+
+interface ConceptCheck {
+  id: string;
+  label: string;
+  patterns: RegExp[];
+}
+
+const CONCEPT_CHECKS: ConceptCheck[] = [
+  { id: "irrevocable", label: "Irrevocable guarantee", patterns: [/\birrevocable\b/i] },
+  { id: "unconditional", label: "Unconditional guarantee", patterns: [/\bunconditional\b/i] },
+  { id: "first_demand", label: "First demand", patterns: [/\bfirst\s+(?:written\s+)?demand\b/i] },
+  { id: "principal_debtor", label: "Principal debtor", patterns: [/\bprincipal\s+debtor\b/i] },
+  { id: "forthwith", label: "Without delay / forthwith payment", patterns: [/\bforthwith\b/i, /\bwithout\s+any\s+delay\b/i] },
+  { id: "new_delhi", label: "Exclusive New Delhi jurisdiction", patterns: [/exclusive\s+jurisdiction.*new\s+delhi/i, /new\s+delhi.*exclusive\s+jurisdiction/i] },
+];
+
+function checkConcepts(text: string): { id: string; label: string; status: "PASS" | "REVIEW"; detail: string; evidence: string }[] {
+  const results: { id: string; label: string; status: "PASS" | "REVIEW"; detail: string; evidence: string }[] = [];
+  for (const check of CONCEPT_CHECKS) {
+    let matched: RegExpMatchArray | null = null;
+    for (const pattern of check.patterns) {
+      const m = text.match(pattern);
+      if (m) { matched = m; break; }
+    }
+    if (matched && matched.index !== undefined) {
+      const start = Math.max(0, matched.index - 100);
+      const end = Math.min(text.length, matched.index + matched[0].length + 180);
+      results.push({
+        id: check.id,
+        label: check.label,
+        status: "PASS",
+        detail: `Required concept detected: ${check.label}.`,
+        evidence: text.substring(start, end),
+      });
+    } else {
+      results.push({
+        id: check.id,
+        label: check.label,
+        status: "REVIEW",
+        detail: `Required concept '${check.label}' was not reliably detected. OCR/manual verification recommended.`,
+        evidence: "",
+      });
+    }
+  }
+  return results;
+}
+
+/* ================================================================
+   16. CLAUSE ORDER (notebook cell 16)
+   ================================================================ */
+
+function checkClauseOrder(
+  clauseDefinitions: { id: string }[],
+  fullText: string,
+): ["PASS" | "REVIEW", string] {
+  const positions: [number, number][] = [];
+  const textM = v_match(fullText);
+
+  for (let idx = 0; idx < clauseDefinitions.length; idx++) {
+    const cid = clauseDefinitions[idx].id;
+    const anchors = CLAUSE_ANCHORS[cid] || [];
+    for (const anchor of anchors) {
+      const pos = textM.indexOf(v_match(anchor));
+      if (pos >= 0) {
+        positions.push([idx, pos]);
+        break;
+      }
+    }
+  }
+
+  if (positions.length < 4) {
+    return ["PASS", "Not enough reliable clause anchors were available to establish an order discrepancy."];
+  }
+  const actual = positions.map(([, pos]) => pos);
+  if (actual.every((v, i) => i === 0 || v >= actual[i - 1])) {
+    return ["PASS", "Reliably detected template clauses appear in the expected sequence."];
+  }
+  return ["REVIEW", "Some clause anchors were detected out of perfect sequence. This may be caused by OCR or document layout."];
+}
+
+/* ================================================================
+   17. NUMBERING (notebook cell 17)
+   ================================================================ */
+
+function checkNumbering(text: string): ["PASS" | "REVIEW", string] {
+  const matches = text.match(/(?:^|[\n ])(\d{1,2})[.)]\s+/g) || [];
+  const nums: number[] = [];
+  for (const m of matches) {
+    const n = parseInt(m.replace(/[^0-9]/g, ""));
+    if (!isNaN(n) && n >= 1 && n <= 20) nums.push(n);
+  }
+  if (nums.length < 4) {
+    return ["PASS", "No reliable clause-numbering contradiction was established."];
+  }
+  const seen: number[] = [];
+  for (const n of nums) {
+    if (!seen.includes(n)) seen.push(n);
+  }
+  if (seen.length >= 4) {
+    const expected = Array.from({ length: Math.max(...seen) - Math.min(...seen) + 1 }, (_, i) => i + Math.min(...seen));
+    const missing = expected.filter((n) => !seen.includes(n));
+    if (missing.length > 0 && missing.length <= 2) {
+      return ["REVIEW", "Possible missing clause numbering: " + missing.join(", ") + ". OCR/layout verification recommended."];
+    }
+  }
+  return ["PASS", "No reliable clause-numbering contradiction was established."];
+}
+
+/* ================================================================
+   18. REPETITION (notebook cell 18)
+   ================================================================ */
+
+function checkRepetition(pages: PageText[]): ["PASS" | "REVIEW", string] {
+  const normalized = pages.map((p) => {
+    const text = v_match(p.text);
+    const sentences = text.split(/(?<=[.!?])\s+/);
+    return sentences.filter((s) => s.split(" ").length >= 18);
+  });
+
+  const repeats: [number, number, string][] = [];
+  for (let i = 0; i < normalized.length; i++) {
+    for (let j = i + 1; j < normalized.length; j++) {
+      for (const block of normalized[i]) {
+        for (const other of normalized[j]) {
+          const score = levenshteinRatio(block, other);
+          if (score >= 97) {
+            repeats.push([i + 1, j + 1, block]);
+          }
+        }
+      }
+    }
+  }
+
+  if (!repeats.length) {
+    return ["PASS", "No unnecessary repeated paragraph/table-like block was detected."];
+  }
+
+  const pairs = [...new Map(repeats.map(([a, b]) => [`${a}-${b}`, [a, b]])).values()];
+  return [
+    "REVIEW",
+    "Substantial repeated content was detected across " +
+      pairs.slice(0, 5).map(([a, b]) => `pages ${a}-${b}`).join(", ") +
+      ". Verify whether the repetition is structurally required.",
+  ];
+}
+
+/* ================================================================
+   19. PAGE LOCALIZATION (notebook cell 19)
+   ================================================================ */
+
+function locateEvidencePage(evidence: string, pages: PageText[]): number | null {
+  if (!evidence) return null;
+  const evidenceM = v_match(evidence);
+  if (!evidenceM) return null;
+
+  let bestPage: number | null = null;
+  let bestScore = 0;
+
+  for (const p of pages) {
+    const pageM = v_match(p.text);
+    if (!pageM) continue;
+    if (pageM.includes(evidenceM.substring(0, 100))) return p.page;
+
+    const score = partialRatio(evidenceM.substring(0, 300), pageM);
+    if (score > bestScore) {
+      bestScore = score;
+      bestPage = p.page;
+    }
+  }
+  return bestPage;
+}
+
+/* ================================================================
+   20. OPTIONAL INFO DETECTION (INFO findings only)
+   ================================================================ */
+
+function checkOptionalInfo(
+  text: string,
+  pages: PageText[],
+  findings: ValidationFinding[],
+  idx: { current: number },
+) {
+  // IFSC
+  const ifsc = text.match(/\b([A-Z]{4}0[A-Z0-9]{6})\b/);
+  if (ifsc) {
+    addFinding(findings, idx, "Optional Information", "ifsc", "IFSC Code", "INFO",
+      `IFSC code detected: ${ifsc[1]}. This is additional bank-specific information.`, undefined, ifsc[1]);
+  }
+
+  // SWIFT/BIC
+  const swift = text.match(/\b([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b/);
+  if (swift) {
+    const exclusions = ["ACCOUNT", "ADDRESS", "COMPANY", "GUARANTEE", "BENEFICIARY", "APPLICANT", "BANKING", "CHARGES", "CUSTOMER", "DETAILS", "DOCUMENT", "FINANCE", "GUARANTEE", "INDICATE", "ISSUANCE", "LETTERS", "MENTION", "NOMINAL", "ORIGINAL", "PAYMENT", "REQUIRE", "SECTION", "TARIFF", "UNIQUE", "VARIANCE"];
+    if (!exclusions.includes(swift[1])) {
+      addFinding(findings, idx, "Optional Information", "swift", "SWIFT / BIC Code", "INFO",
+        `SWIFT/BIC code detected: ${swift[1]}. This is additional bank-specific information.`, undefined, swift[1]);
+    }
+  }
+
+  // Branch
+  const branch = text.match(/branch\s*[:.]?\s*(.+?)(?:\n|$)/i);
+  if (branch) {
+    addFinding(findings, idx, "Optional Information", "branch", "Branch Information", "INFO",
+      `Branch information detected: ${branch[1].trim().substring(0, 100)}`, undefined, branch[1].trim().substring(0, 100));
+  }
+
+  // Email
+  const email = text.match(/[\w.-]+@[\w.-]+\.[A-Za-z]{2,}/);
+  if (email) {
+    addFinding(findings, idx, "Optional Information", "email", "Email Contact", "INFO",
+      `Email address detected: ${email[0]}`, undefined, email[0]);
+  }
+
+  // Phone
+  const phone = text.match(/(?:\+91[\s-]?)?0?\d{10}\b/);
+  if (phone) {
+    addFinding(findings, idx, "Optional Information", "phone", "Phone Contact", "INFO",
+      `Phone number detected: ${phone[0]}`, undefined, phone[0]);
+  }
+
+  // GST
+  const gst = text.match(/\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z\d]\b/);
+  if (gst) {
+    addFinding(findings, idx, "Optional Information", "gst", "GST Number", "INFO",
+      `GST number detected: ${gst[0]}`, undefined, gst[0]);
+  }
+
+  // PAN
+  const pan = text.match(/\b[A-Z]{5}\d{4}[A-Z]\b/);
+  if (pan) {
+    addFinding(findings, idx, "Optional Information", "pan", "PAN Number", "INFO",
+      `PAN number detected: ${pan[0]}`, undefined, pan[0]);
+  }
+
+  // Address
+  const address = text.match(/(?:address|registered\s+office|corporate\s+office|branch\s+office)\s*[:.]?\s*(.+?)(?:\n|$)/gi);
+  if (address && address[0]) {
+    const addr = v_norm(address[0].replace(/^[^:]+:?\s*/, ""));
+    if (addr.length > 10) {
+      addFinding(findings, idx, "Optional Information", "address", "Address Information", "INFO",
+        `Address detected in the document: "${addr.substring(0, 120)}${addr.length > 120 ? "…" : ""}"`,
+        undefined, addr.substring(0, 120));
+    }
+  }
+}
+
+/* ================================================================
+   21. DOCUMENT QUALITY CHECKS
+   ================================================================ */
+
+function checkDocumentQuality(
+  text: string,
+  pages: { pageNumber: number; text: string; isScanned?: boolean; confidence?: number }[],
+  findings: ValidationFinding[],
+  idx: { current: number },
+) {
+  const wordCount = text.split(/\s+/).filter((w) => w.length > 0).length;
+  const charCount = text.replace(/\s/g, "").length;
+
+  if (wordCount < 30 || charCount < 100) {
+    addFinding(findings, idx, "Document Validation", "low_text_quality", "Document Text Quality", "FAIL",
+      `Only ${wordCount} words (${charCount} characters) extracted. The document may be corrupted, empty, or require better OCR processing.`);
+  } else if (wordCount < 100) {
+    addFinding(findings, idx, "Document Validation", "low_text_quality", "Document Text Quality", "REVIEW",
+      `Only ${wordCount} words extracted. Some content may be missing or difficult to extract. Check the extracted text for completeness.`);
+  } else {
+    addFinding(findings, idx, "Document Validation", "low_text_quality", "Document Text Quality", "PASS",
+      `Document contains ${wordCount} words. Text extraction appears successful.`);
+  }
+
+  // Scanned page quality
+  const scannedPages = pages.filter((p) => p.isScanned === true);
+  if (scannedPages.length > 0) {
+    addFinding(findings, idx, "Document Validation", "scanned_pages", "Scanned Pages Detected", "INFO",
+      `${scannedPages.length} of ${pages.length} page(s) were detected as scanned and processed via OCR.`);
+    for (const page of scannedPages) {
+      if (page.confidence != null && page.confidence < 0.5) {
+        addFinding(findings, idx, "Document Validation", `page_quality_${page.pageNumber}`, `Page ${page.pageNumber} — Low OCR Confidence`, "REVIEW",
+          `Page ${page.pageNumber} had low OCR confidence (${Math.round(page.confidence * 100)}%). The extracted text on this page may contain errors.`, page.pageNumber);
+      }
+    }
+  }
+
+  // Garbled text
+  const garbled = text.match(/[^\x00-\x7F]{5,}/g);
+  if (garbled && garbled.length > 3) {
+    addFinding(findings, idx, "Document Validation", "garbled_text", "Garbled Text Detected", "REVIEW",
+      `${garbled.length} garbled text sequences found. These may be OCR artifacts or encoding issues from scanned documents.`);
+  }
+
+  // Structure check
+  const bgLower = text.toLowerCase();
+  const hasTitle = bgLower.includes("bank guarantee") || bgLower.includes("guarantee");
+  const hasParties = bgLower.includes("beneficiary") || bgLower.includes("applicant") || bgLower.includes("principal");
+  const hasAmount = extractAmountFigures(text).length > 0;
+  const hasDates = extractLabeledDates(text).issue.length + extractLabeledDates(text).expiry.length > 0;
+  const hasTerms = bgLower.includes("terms and conditions") || bgLower.includes("conditions") || bgLower.includes("terms of");
+  const elements = [hasTitle && "title", hasParties && "parties", hasAmount && "amount", hasDates && "dates", hasTerms && "terms"].filter(Boolean);
+  const score = elements.length / 5;
+
+  if (score >= 0.8) {
+    addFinding(findings, idx, "Document Validation", "structure_check", "Document Structure", "PASS",
+      `Document structure appears complete (${elements.join(", ")}).`);
+  } else if (score >= 0.4) {
+    addFinding(findings, idx, "Document Validation", "structure_check", "Document Structure", "REVIEW",
+      `Only ${elements.length} of 5 key structural elements detected (${elements.join(", ")}). Some elements may be missing.`);
+  } else {
+    addFinding(findings, idx, "Document Validation", "structure_check", "Document Structure", "FAIL",
+      `Only ${elements.length} of 5 key structural elements found. The document may not be a valid Bank Guarantee.`);
+  }
+}
+
+/* ================================================================
+   MAIN VALIDATION ENGINE — exact notebook validate_document()
+   ================================================================ */
 
 export function validateBg(
   templateClauses: TemplateClause[],
   templateText: string,
   bgText: string,
-  bgPages: { pageNumber: number; text: string; isScanned?: boolean; confidence?: number }[]
+  bgPages: { pageNumber: number; text: string; isScanned?: boolean; confidence?: number }[],
+  userInstructions?: string,
 ): ValidationFinding[] {
   const findings: ValidationFinding[] = [];
-  let findingIdx = 0;
+  const idx = { current: 0 };
 
-  const addFinding = (
-    category: FindingCategory,
-    checkId: string,
-    label: string,
-    status: ValidationFinding["status"],
-    detail: string,
-    pageNumber?: number,
-    extractedText?: string
-  ) => {
-    findingIdx++;
-    findings.push({
-      id: `f_${findingIdx}`,
-      category,
-      checkId,
-      label,
-      status,
-      detail,
-      pageNumber,
-      extractedText,
-    });
-  };
+  const pages = getPageTexts(bgPages);
+  const fullText = pages.map((p) => p.text).join("\n");
 
-  /* ================================================================
-     1. CLAUSE VALIDATION — Check each template clause is present
-     ================================================================ */
-
-  for (const clause of templateClauses) {
-    const clauseNormalized = normalize(clause.content);
-    const clauseWords = clauseNormalized
-      .split(" ")
-      .filter((w) => w.length > 3);
-    const sampleWords = clauseWords.slice(0, Math.min(10, clauseWords.length));
-
-    if (sampleWords.length === 0) continue;
-
-    const bgLower = bgText.toLowerCase();
-    const foundCount = sampleWords.filter((w) => bgLower.includes(w)).length;
-    const matchRatio = foundCount / sampleWords.length;
-
-    // Also try bigram similarity on the full clause content
-    let bestPageSimilarity = 0;
-    let bestPage = 0;
-    for (const page of bgPages) {
-      const sim = similarity(clause.content, page.text);
-      if (sim > bestPageSimilarity) {
-        bestPageSimilarity = sim;
-        bestPage = page.pageNumber;
-      }
-    }
-
-    const combinedScore = Math.max(matchRatio, bestPageSimilarity);
-
-    if (combinedScore >= 0.6) {
-      addFinding(
-        "Clause Validation",
-        `clause_present_${clause.id}`,
-        `Clause: ${clause.label.substring(0, 80)}`,
-        "PASS",
-        `Template clause detected in the document (match: ${Math.round(combinedScore * 100)}%).`,
-        bestPage > 0 && bestPageSimilarity >= matchRatio ? bestPage : undefined
-      );
-    } else if (combinedScore >= 0.25) {
-      addFinding(
-        "Clause Validation",
-        `clause_present_${clause.id}`,
-        `Clause: ${clause.label.substring(0, 80)}`,
-        "REVIEW",
-        `Partial match detected (${Math.round(combinedScore * 100)}%). The clause may differ from the template. Manual review recommended.`,
-        bestPage > 0 && bestPageSimilarity >= matchRatio ? bestPage : undefined
-      );
-    } else {
-      addFinding(
-        "Clause Validation",
-        `clause_present_${clause.id}`,
-        `Clause: ${clause.label.substring(0, 80)}`,
-        "FAIL",
-        `Template clause not found in the document. This clause may be missing or significantly altered.`
-      );
-    }
-  }
-
-  /* ================================================================
-     2. EXTRA / ADDITIONAL CONTENT DETECTION
-     ================================================================ */
-
-  const templateWords = new Set(
-    normalize(templateText)
-      .split(" ")
-      .filter((w) => w.length > 5)
-  );
-  const bgWordsNormalized = normalize(bgText).split(" ");
-  const additionalWords = bgWordsNormalized.filter(
-    (w) => w.length > 8 && !templateWords.has(w)
-  );
-
-  if (additionalWords.length > 30) {
-    addFinding(
-      "Clause Validation",
-      "extra_content",
-      "Additional Bank-Specific Content",
-      "INFO",
-      `The BG contains ${additionalWords.length} terms not found in the template. These may be bank-specific additions such as IFSC, SWIFT, branch details, or additional conditions.`
-    );
-  } else {
-    addFinding(
-      "Clause Validation",
-      "extra_content",
-      "Additional Content Check",
-      "PASS",
-      "No significant additional content beyond the template structure was detected."
-    );
-  }
-
-  /* ================================================================
-     3. CLAUSE ORDERING
-     ================================================================ */
-
-  if (templateClauses.length > 1) {
-    const bgLower = bgText.toLowerCase();
-    let orderingOk = true;
-    let lastPosition = -1;
-    let matchedClauses = 0;
-
+  // Build clause definitions from template (notebook cell 4)
+  const clauseDefinitions = CANONICAL_STARTS.map(([cid, title]) => {
+    // Try to find matching clause from uploaded template
+    let text = title;
     for (const clause of templateClauses) {
-      const key = normalize(clause.content)
-        .split(" ")
-        .filter((w) => w.length > 4)
-        .slice(0, 3);
-      if (key.length === 0) continue;
-
-      const pos = bgLower.indexOf(key[0]);
-      if (pos >= 0) {
-        matchedClauses++;
-        if (pos < lastPosition) {
-          orderingOk = false;
-        }
-        lastPosition = pos;
+      const cId = String(clause.id || "").toUpperCase();
+      const cTitle = v_norm(clause.label || "");
+      const cText = v_norm(clause.content || "");
+      if (cId === cid || cTitle.includes(title.toLowerCase())) {
+        if (cText) text = cText;
       }
     }
+    return { id: cid, title, text };
+  });
 
-    if (matchedClauses < 2) {
-      addFinding(
-        "Clause Validation",
-        "clause_ordering",
-        "Clause Ordering",
-        "REVIEW",
-        "Could not reliably determine clause ordering. Too few clause markers matched."
-      );
-    } else if (orderingOk) {
-      addFinding(
-        "Clause Validation",
-        "clause_ordering",
-        "Clause Ordering",
-        "PASS",
-        "Clause order is consistent with the reference template."
-      );
-    } else {
-      addFinding(
-        "Clause Validation",
-        "clause_ordering",
-        "Clause Ordering",
-        "REVIEW",
-        "Clause ordering differs from the template. This may indicate structural modifications or reordering."
-      );
+  /* ── C1-C10: CLAUSE VALIDATION ── */
+  for (const definition of clauseDefinitions) {
+    const result = validateClause(definition, pages);
+    addFinding(findings, idx, "Clause Validation", definition.id, definition.title,
+      result.status, result.detail, result.page ?? undefined, result.evidence || undefined, result.similarity);
+  }
+
+  /* ── AMOUNT CONSISTENCY ── */
+  const [amtStatus, amtDetail] = checkAmountConsistency(fullText);
+  addFinding(findings, idx, "Consistency Validation", "amount_consistency", "Amount in words and figures",
+    amtStatus, amtDetail);
+
+  /* ── BG NUMBER ── */
+  const [bgStatus, bgDetail] = checkBgNumber(fullText);
+  const bgNumbers = extractBgNumbers(fullText);
+  addFinding(findings, idx, "Consistency Validation", "bg_number", "BG number consistency",
+    bgStatus, bgDetail, undefined, bgNumbers[0] || "");
+
+  /* ── CONTRACT REFERENCE ── */
+  const [refStatus, refDetail] = checkReference(fullText);
+  const references = extractReferences(fullText);
+  addFinding(findings, idx, "Consistency Validation", "contract_reference", "Contract / purchase-order reference",
+    refStatus, refDetail, undefined, references.slice(0, 3).join(", "));
+
+  /* ── DATE LOGIC ── */
+  const [dateStatus, dateDetail] = checkDateLogic(fullText);
+  const labeledDates = extractLabeledDates(fullText);
+  const evidenceParts: string[] = [];
+  if (labeledDates.expiry.length) evidenceParts.push(`Expiry=${labeledDates.expiry[0].toISOString().slice(0, 10)}`);
+  if (labeledDates.claim_expiry.length) evidenceParts.push(`Claim=${labeledDates.claim_expiry[0].toISOString().slice(0, 10)}`);
+  addFinding(findings, idx, "Logical Validation", "date_logic", "Date / claim-period consistency",
+    dateStatus, dateDetail, undefined, evidenceParts.join(" | "));
+
+  /* ── BENEFICIARY ── */
+  const [benStatus, benDetail] = checkBeneficiary(templateText, fullText);
+  addFinding(findings, idx, "Consistency Validation", "beneficiary", "Beneficiary consistency",
+    benStatus, benDetail);
+
+  /* ── SIGNATURE ── */
+  const [sigStatus, sigDetail, sigEvidence] = checkSignature(fullText);
+  const sigPage = locateEvidencePage(sigEvidence, pages);
+  addFinding(findings, idx, "Logical Validation", "signature", "Signature / authorization",
+    sigStatus, sigDetail, sigPage ?? undefined, sigEvidence || undefined);
+
+  /* ── STAMP ── */
+  const [stampStatus, stampDetail, stampEvidence] = checkStamp(fullText, templateText);
+  const stampPage = locateEvidencePage(stampEvidence, pages);
+  addFinding(findings, idx, "Logical Validation", "stamp", "Stamp / e-Stamp evidence",
+    stampStatus, stampDetail, stampPage ?? undefined, stampEvidence || undefined);
+
+  /* ── CONCEPT CHECKS ── */
+  const conceptResults = checkConcepts(fullText);
+  for (const item of conceptResults) {
+    const page = locateEvidencePage(item.evidence, pages);
+    const category: FindingCategory = "Logical Validation";
+    addFinding(findings, idx, category, item.id, item.label,
+      item.status, item.detail, page ?? undefined, item.evidence || undefined);
+  }
+
+  /* ── CLAUSE ORDER ── */
+  const [orderStatus, orderDetail] = checkClauseOrder(clauseDefinitions, fullText);
+  addFinding(findings, idx, "Clause Validation", "clause_order", "Paragraph / clause order",
+    orderStatus, orderDetail);
+
+  /* ── NUMBERING ── */
+  const [numStatus, numDetail] = checkNumbering(fullText);
+  addFinding(findings, idx, "Clause Validation", "numbering", "Paragraph numbering",
+    numStatus, numDetail);
+
+  /* ── REPETITION ── */
+  const [repStatus, repDetail] = checkRepetition(pages);
+  addFinding(findings, idx, "Document Validation", "repetition", "Repeated paragraph / table content",
+    repStatus, repDetail);
+
+  /* ── DOCUMENT QUALITY ── */
+  checkDocumentQuality(fullText, bgPages, findings, idx);
+
+  /* ── OPTIONAL INFO (INFO findings) ── */
+  checkOptionalInfo(fullText, pages, findings, idx);
+
+  /* ── PAGE-LEVEL EVIDENCE LOCALIZATION ── */
+  for (const finding of findings) {
+    if (finding.pageNumber == null && finding.extractedText) {
+      const page = locateEvidencePage(finding.extractedText, pages);
+      if (page != null) finding.pageNumber = page;
     }
   }
 
-  /* ================================================================
-     4. TEMPLATE–BG FIELD MATCHING (cross-reference key fields)
-     ================================================================ */
-
-  // 4a. Beneficiary name
-  const beneficiaryPatterns = [
-    /(?:beneficiary|in favour of|in\s+favor\s+of)\s*[:.]?\s*(.+?)(?:\n|$)/gi,
-  ];
-  const templateBeneficiary = extractField(templateText, beneficiaryPatterns);
-  const bgBeneficiary = extractField(bgText, beneficiaryPatterns);
-
-  if (templateBeneficiary && bgBeneficiary) {
-    const bSim = similarity(templateBeneficiary, bgBeneficiary);
-    if (bSim >= 0.7) {
-      addFinding(
-        "Consistency Validation",
-        "beneficiary_match",
-        "Beneficiary Name",
-        "PASS",
-        `Beneficiary matches the template: "${bgBeneficiary}"`,
-        undefined,
-        bgBeneficiary
-      );
-    } else {
-      addFinding(
-        "Consistency Validation",
-        "beneficiary_match",
-        "Beneficiary Name",
-        "FAIL",
-        `Beneficiary in BG ("${bgBeneficiary}") differs from template ("${templateBeneficiary}"). This may be an error.`,
-        undefined,
-        bgBeneficiary
-      );
-    }
-  } else if (bgBeneficiary) {
-    addFinding(
-      "Consistency Validation",
-      "beneficiary_detected",
-      "Beneficiary Name",
-      "INFO",
-      `Beneficiary detected in BG: "${bgBeneficiary}". No template reference to compare against.`,
-      undefined,
-      bgBeneficiary
-    );
-  } else if (templateBeneficiary) {
-    addFinding(
-      "Consistency Validation",
-      "beneficiary_missing",
-      "Beneficiary Name",
-      "REVIEW",
-      "No beneficiary name found in the BG. This field is typically required."
-    );
+  /* ── USER INSTRUCTIONS ── */
+  if (userInstructions && userInstructions.trim()) {
+    addFinding(findings, idx, "Logical Validation", "user_instructions", "User Instructions Provided",
+      "INFO", `Additional validation instructions were provided: "${userInstructions.trim()}"`);
   }
-
-  // 4b. Applicant / Principal name
-  const applicantPatterns = [
-    /(?:applicant|principal|guarantor|we|the undersigned)\s*[:.]?\s*(.+?)(?:\n|$)/gi,
-  ];
-  const templateApplicant = extractField(templateText, applicantPatterns);
-  const bgApplicant = extractField(bgText, applicantPatterns);
-
-  if (templateApplicant && bgApplicant) {
-    const aSim = similarity(templateApplicant, bgApplicant);
-    if (aSim >= 0.6) {
-      addFinding(
-        "Consistency Validation",
-        "applicant_match",
-        "Applicant / Principal",
-        "PASS",
-        `Applicant matches the template: "${bgApplicant}"`,
-        undefined,
-        bgApplicant
-      );
-    } else {
-      addFinding(
-        "Consistency Validation",
-        "applicant_match",
-        "Applicant / Principal",
-        "REVIEW",
-        `Applicant in BG ("${bgApplicant}") differs from template ("${templateApplicant}"). Verify this is correct.`,
-        undefined,
-        bgApplicant
-      );
-    }
-  } else if (bgApplicant) {
-    addFinding(
-      "Consistency Validation",
-      "applicant_detected",
-      "Applicant / Principal",
-      "INFO",
-      `Applicant detected: "${bgApplicant}". No template reference available.`,
-      undefined,
-      bgApplicant
-    );
-  }
-
-  // 4c. Issuing Bank name
-  const bankPatterns = [
-    /(?:issuing bank|guarantor bank|bank)\s*[:.]?\s*(.+?)(?:\n|$)/gi,
-  ];
-  const templateBank = extractField(templateText, bankPatterns);
-  const bgBank = extractField(bgText, bankPatterns);
-
-  if (templateBank && bgBank) {
-    const bkSim = similarity(templateBank, bgBank);
-    if (bkSim >= 0.6) {
-      addFinding(
-        "Consistency Validation",
-        "bank_name_match",
-        "Issuing Bank",
-        "PASS",
-        `Issuing bank matches the template: "${bgBank}"`,
-        undefined,
-        bgBank
-      );
-    } else {
-      addFinding(
-        "Consistency Validation",
-        "bank_name_match",
-        "Issuing Bank",
-        "REVIEW",
-        `Issuing bank in BG ("${bgBank}") differs from template ("${templateBank}"). Verify this is the correct issuing institution.`,
-        undefined,
-        bgBank
-      );
-    }
-  } else if (bgBank) {
-    addFinding(
-      "Consistency Validation",
-      "bank_name_detected",
-      "Issuing Bank",
-      "INFO",
-      `Issuing bank detected: "${bgBank}". No template reference available.`,
-      undefined,
-      bgBank
-    );
-  }
-
-  /* ================================================================
-     5. AMOUNT CONSISTENCY
-     ================================================================ */
-
-  const amountPatterns = [
-    /(?:Rs\.?|INR|₹)\s*([\d,]+(?:\.\d{2})?)/gi,
-    /(?:USD|\$)\s*([\d,]+(?:\.\d{2})?)/gi,
-    /(?:EUR|€)\s*([\d,]+(?:\.\d{2})?)/gi,
-    /(?:GBP|£)\s*([\d,]+(?:\.\d{2})?)/gi,
-    /(?:AED|SGD|JPY|AUD|CAD)\s*([\d,]+(?:\.\d{2})?)/gi,
-    /(?:amount|sum|value|guarantee(?:ed)?\s+amount)\s*(?:of|:|for)?\s*(?:Rs\.?|INR|USD|EUR|GBP|₹|\$|€|£)?\s*([\d,]+(?:\.\d{2})?)/gi,
-  ];
-
-  const amounts: string[] = [];
-  for (const pat of amountPatterns) {
-    const matches = findAllMatches(bgText, pat);
-    amounts.push(...matches.map((m) => m.replace(/,/g, "")));
-  }
-
-  if (amounts.length > 0) {
-    const uniqueAmounts = [...new Set(amounts)];
-
-    if (uniqueAmounts.length === 1) {
-      addFinding(
-        "Consistency Validation",
-        "amount_consistency",
-        "Amount Consistency",
-        "PASS",
-        `All amount references are consistent: ${amounts[0]}`
-      );
-    } else {
-      addFinding(
-        "Consistency Validation",
-        "amount_consistency",
-        "Amount Consistency",
-        "FAIL",
-        `Different amounts detected: ${uniqueAmounts.join(", ")}. Verify which is the correct guarantee amount.`,
-        undefined,
-        uniqueAmounts.join(", ")
-      );
-    }
-
-    // Cross-check with template amount
-    const templateAmounts: string[] = [];
-    for (const pat of amountPatterns) {
-      const matches = findAllMatches(templateText, pat);
-      templateAmounts.push(...matches.map((m) => m.replace(/,/g, "")));
-    }
-    if (templateAmounts.length > 0) {
-      const templateAmt = templateAmounts[0];
-      const bgAmt = amounts[0];
-      if (templateAmt === bgAmt) {
-        addFinding(
-          "Consistency Validation",
-          "amount_template_match",
-          "Amount vs Template",
-          "PASS",
-          `BG amount (${bgAmt}) matches the template amount (${templateAmt}).`
-        );
-      } else {
-        addFinding(
-          "Consistency Validation",
-          "amount_template_match",
-          "Amount vs Template",
-          "REVIEW",
-          `BG amount (${bgAmt}) differs from template amount (${templateAmt}). Verify if this is intentional.`
-        );
-      }
-    }
-  } else {
-    addFinding(
-      "Consistency Validation",
-      "amount_detected",
-      "Amount Detection",
-      "REVIEW",
-      "No explicit amount pattern detected. Verify the guarantee amount is clearly stated in the document."
-    );
-  }
-
-  /* ================================================================
-     6. AMOUNT IN WORDS vs FIGURES
-     ================================================================ */
-
-  const wordsPatterns = [
-    /(?:Rupees|Dollars|Euros|Pounds)\s+(.+?)(?:\s+only|\s*[,.\n]|$)/gi,
-  ];
-  const wordAmounts: string[] = [];
-  for (const pat of wordsPatterns) {
-    const matches = findAllMatches(bgText, pat);
-    wordAmounts.push(...matches);
-  }
-
-  if (wordAmounts.length > 0 && amounts.length > 0) {
-    addFinding(
-      "Consistency Validation",
-      "amount_words_figures",
-      "Amount in Words vs Figures",
-      "REVIEW",
-      `Amount in words detected: "${wordAmounts[0]}". Cross-verify with the numeric amount (${amounts[0]}).`,
-      undefined,
-      wordAmounts[0]
-    );
-  } else if (wordAmounts.length > 0) {
-    addFinding(
-      "Consistency Validation",
-      "amount_words_only",
-      "Amount in Words",
-      "INFO",
-      `Amount expressed in words: "${wordAmounts[0]}". No numeric amount found for comparison.`,
-      undefined,
-      wordAmounts[0]
-    );
-  } else if (amounts.length > 0) {
-    // Amount found in figures but not in words — some BGs only have figures
-    addFinding(
-      "Consistency Validation",
-      "amount_figures_only",
-      "Amount in Figures Only",
-      "INFO",
-      `Amount found in numeric form (${amounts[0]}). No amount-in-words expression detected.`
-    );
-  }
-
-  /* ================================================================
-     7. BG NUMBER CONSISTENCY
-     ================================================================ */
-
-  const bgNumberPatterns = [
-    /(?:BG|Guarantee|Guaranty|Bank\s+Guarantee)\s*(?:No|Number|Ref|Reference)\.?\s*[:.]?\s*([A-Z0-9\/\-]+)/gi,
-    /(?:Ref(?:erence)?|Our\s+Ref)\.?\s*(?:No\.?)?\s*[:.]?\s*([A-Z0-9\/\-]+)/gi,
-  ];
-
-  const bgNumbers: string[] = [];
-  for (const pat of bgNumberPatterns) {
-    const matches = findAllMatches(bgText, pat);
-    bgNumbers.push(...matches);
-  }
-
-  if (bgNumbers.length > 0) {
-    const uniqueBgs = [...new Set(bgNumbers)];
-    if (uniqueBgs.length === 1) {
-      addFinding(
-        "Consistency Validation",
-        "bg_number",
-        "BG Number",
-        "PASS",
-        `BG reference number is consistent: ${bgNumbers[0]}`,
-        undefined,
-        bgNumbers[0]
-      );
-    } else {
-      addFinding(
-        "Consistency Validation",
-        "bg_number",
-        "BG Number",
-        "FAIL",
-        `Multiple BG numbers detected: ${uniqueBgs.join(", ")}. Only one BG number should be present.`,
-        undefined,
-        uniqueBgs.join(", ")
-      );
-    }
-
-    // Cross-check with template
-    const templateBgNumbers: string[] = [];
-    for (const pat of bgNumberPatterns) {
-      const matches = findAllMatches(templateText, pat);
-      templateBgNumbers.push(...matches);
-    }
-    if (templateBgNumbers.length > 0 && templateBgNumbers[0] !== bgNumbers[0]) {
-      addFinding(
-        "Consistency Validation",
-        "bg_number_template",
-        "BG Number vs Template",
-        "REVIEW",
-        `BG number (${bgNumbers[0]}) differs from template (${templateBgNumbers[0]}). Verify this is intentional.`
-      );
-    }
-  }
-
-  /* ================================================================
-     8. CONTRACT / PO / LOA / FOA REFERENCES
-     ================================================================ */
-
-  const contractPatterns = [
-    /(?:Contract|PO|Purchase\s+Order|LOA|Letter\s+of\s+Award|FOA|Work\s+Order|Agreement)\s*(?:No|Number|Ref|Reference)\.?\s*[:.]?\s*([A-Z0-9\/\-]+)/gi,
-  ];
-
-  const contracts: string[] = [];
-  for (const pat of contractPatterns) {
-    const matches = findAllMatches(bgText, pat);
-    contracts.push(...matches);
-  }
-
-  if (contracts.length > 0) {
-    const uniqueContracts = [...new Set(contracts)];
-    if (uniqueContracts.length === 1) {
-      addFinding(
-        "Consistency Validation",
-        "contract_ref",
-        "Contract / PO Reference",
-        "PASS",
-        `Contract reference is consistent: ${contracts[0]}`,
-        undefined,
-        contracts[0]
-      );
-    } else {
-      addFinding(
-        "Consistency Validation",
-        "contract_ref",
-        "Contract / PO Reference",
-        "REVIEW",
-        `Multiple contract references detected: ${uniqueContracts.join(", ")}. Verify consistency.`,
-        undefined,
-        uniqueContracts.join(", ")
-      );
-    }
-
-    // Cross-check with template
-    const templateContracts: string[] = [];
-    for (const pat of contractPatterns) {
-      const matches = findAllMatches(templateText, pat);
-      templateContracts.push(...matches);
-    }
-    if (templateContracts.length > 0 && templateContracts[0] !== contracts[0]) {
-      addFinding(
-        "Consistency Validation",
-        "contract_template_match",
-        "Contract Reference vs Template",
-        "REVIEW",
-        `Contract reference in BG (${contracts[0]}) differs from template (${templateContracts[0]}). Verify this is intentional.`
-      );
-    }
-  }
-
-  /* ================================================================
-     9. DATE DETECTION & VALIDATION
-     ================================================================ */
-
-  // Match multiple date formats
-  const datePatterns = [
-    /(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/g,      // DD/MM/YYYY
-    /(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2})\b/g,      // DD/MM/YY
-    /(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/gi, // DD Month YYYY
-  ];
-
-  const allDates: string[] = [];
-  for (const pat of datePatterns) {
-    let m;
-    const localPat = new RegExp(pat.source, pat.flags);
-    while ((m = localPat.exec(bgText)) !== null) {
-      allDates.push(m[0]);
-    }
-  }
-
-  if (allDates.length > 0) {
-    addFinding(
-      "Consistency Validation",
-      "date_values",
-      "Dates Detected",
-      "INFO",
-      `Dates found in the document: ${[...new Set(allDates)].join(", ")}.`
-    );
-  }
-
-  // Date ordering check
-  if (allDates.length >= 2) {
-    const parseBgDate = (d: string): number | null => {
-      // Try DD/MM/YYYY
-      const parts = d.split(/[\/\-\.]/);
-      if (parts.length === 3) {
-        const day = parseInt(parts[0]);
-        const month = parseInt(parts[1]);
-        let year = parseInt(parts[2]);
-        if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-        if (year < 100) year += 2000;
-        return new Date(year, month - 1, day).getTime();
-      }
-      // Try "DD Month YYYY"
-      const altMatch = d.match(/(\d{1,2})\s+(\w+)\s+(\d{4})/);
-      if (altMatch) {
-        return new Date(`${altMatch[2]} ${altMatch[1]}, ${altMatch[3]}`).getTime();
-      }
-      return null;
-    };
-
-    const parsedDates = allDates
-      .map(parseBgDate)
-      .filter((d): d is number => d !== null);
-
-    if (parsedDates.length >= 2) {
-      const isChronological = parsedDates.every(
-        (d, i) => i === 0 || d >= parsedDates[i - 1]
-      );
-      if (isChronological) {
-        addFinding(
-          "Logical Validation",
-          "date_ordering",
-          "Date Ordering",
-          "PASS",
-          "All dates appear in chronological order."
-        );
-      } else {
-        addFinding(
-          "Logical Validation",
-          "date_ordering",
-          "Date Ordering",
-          "REVIEW",
-          "Dates are not in chronological order. Verify issue and expiry dates are correct."
-        );
-      }
-    }
-
-    // Check for expiry date specifically
-    const expiryPatterns = [
-      /(?:expir[ey]|valid\s+until|validity\s+(?:up\s+)?to|expiry\s+date)\s*[:.]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/gi,
-    ];
-    const expiryMatch = extractField(bgText, expiryPatterns);
-
-    // Check for issue date
-    const issueDatePatterns = [
-      /(?:date\s+of\s+(?:issue|execution)|issued?\s+(?:on|date)|dated?)\s*[:.]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/gi,
-    ];
-    const issueDate = extractField(bgText, issueDatePatterns);
-
-    if (issueDate && expiryMatch) {
-      addFinding(
-        "Logical Validation",
-        "date_issue_expiry",
-        "Issue & Expiry Dates",
-        "PASS",
-        `Issue date: ${issueDate}, Expiry date: ${expiryMatch}. Both are present.`
-      );
-    } else if (expiryMatch) {
-      addFinding(
-        "Logical Validation",
-        "date_expiry_found",
-        "Expiry Date",
-        "PASS",
-        `Expiry date detected: ${expiryMatch}.`
-      );
-    } else if (issueDate) {
-      addFinding(
-        "Logical Validation",
-        "date_issue_found",
-        "Issue Date",
-        "PASS",
-        `Issue date detected: ${issueDate}.`
-      );
-    }
-  }
-
-  /* ================================================================
-     10. CLAIM PERIOD / VALIDITY PERIOD
-     ================================================================ */
-
-  const claimPeriodPatterns = [
-    /(?:claim|validity|period|validity\s+period)\s*(?:within|of|:)?\s*(\d+)\s*(days?|months?|years?|calender?\s+days?)/gi,
-  ];
-
-  const claimMatch = extractField(bgText, claimPeriodPatterns);
-
-  if (claimMatch) {
-    addFinding(
-      "Logical Validation",
-      "claim_period",
-      "Claim / Validity Period",
-      "PASS",
-      `Claim/validity period specified: ${claimMatch}.`
-    );
-
-    // Cross-check with template
-    const templateClaim = extractField(templateText, claimPeriodPatterns);
-    if (templateClaim && templateClaim !== claimMatch) {
-      addFinding(
-        "Logical Validation",
-        "claim_period_template",
-        "Claim Period vs Template",
-        "REVIEW",
-        `BG claim period (${claimMatch}) differs from template (${templateClaim}). Verify this is intentional.`
-      );
-    }
-  } else {
-    addFinding(
-      "Logical Validation",
-      "claim_period",
-      "Claim / Validity Period",
-      "REVIEW",
-      "No explicit claim or validity period found. Verify the guarantee has a defined validity."
-    );
-  }
-
-  /* ================================================================
-     11. REQUIRED CONDITIONS — On Demand / Irrevocable / Unconditional
-     ================================================================ */
-
-  const bgLower = bgText.toLowerCase();
-
-  // On demand / first demand
-  const hasOnDemand =
-    bgLower.includes("on demand") ||
-    bgLower.includes("first demand") ||
-    bgLower.includes("on-first demand") ||
-    bgLower.includes("at first demand");
-
-  if (hasOnDemand) {
-    addFinding(
-      "Logical Validation",
-      "on_demand",
-      "On Demand / First Demand",
-      "PASS",
-      "On demand / first demand language detected. The guarantee can be called upon first written demand."
-    );
-  } else {
-    addFinding(
-      "Logical Validation",
-      "on_demand",
-      "On Demand / First Demand",
-      "REVIEW",
-      "No explicit 'on demand' or 'first demand' language found. Verify the guarantee type and call conditions."
-    );
-  }
-
-  // Irrevocable
-  const hasIrrevocable =
-    bgLower.includes("irrevocable") || bgLower.includes("irrevocably");
-
-  if (hasIrrevocable) {
-    addFinding(
-      "Logical Validation",
-      "irrevocable",
-      "Irrevocable",
-      "PASS",
-      "Irrevocable language detected. The guarantee cannot be amended or cancelled without consent."
-    );
-  } else {
-    addFinding(
-      "Logical Validation",
-      "irrevocable",
-      "Irrevocable",
-      "REVIEW",
-      "No explicit 'irrevocable' language found. Verify whether the guarantee is irrevocable."
-    );
-  }
-
-  // Unconditional
-  const hasUnconditional =
-    bgLower.includes("unconditional") || bgLower.includes("unconditionally");
-
-  if (hasUnconditional) {
-    addFinding(
-      "Logical Validation",
-      "unconditional",
-      "Unconditional",
-      "PASS",
-      "Unconditional language detected. The guarantee has no conditions attached to the call."
-    );
-  } else {
-    addFinding(
-      "Logical Validation",
-      "unconditional",
-      "Unconditional",
-      "INFO",
-      "No explicit 'unconditional' language found. Some guarantees use alternative phrasing."
-    );
-  }
-
-  /* ================================================================
-     12. CURRENCY CONSISTENCY
-     ================================================================ */
-
-  const currencyRegex = /\b(USD|EUR|GBP|INR|AED|SGD|JPY|AUD|CAD|CHF|CNY|HKD|MYR|THB|ZAR)\b/gi;
-  const currencies = bgText.match(currencyRegex);
-
-  if (currencies) {
-    const uniqueCurrencies = [...new Set(currencies.map((c) => c.toUpperCase()))];
-    if (uniqueCurrencies.length > 1) {
-      addFinding(
-        "Logical Validation",
-        "currency_consistency",
-        "Currency Consistency",
-        "FAIL",
-        `Multiple currencies detected: ${uniqueCurrencies.join(", ")}. This may indicate an error unless the document legitimately references multiple currencies.`
-      );
-    } else {
-      addFinding(
-        "Logical Validation",
-        "currency_consistency",
-        "Currency Consistency",
-        "PASS",
-        `Consistent currency detected: ${uniqueCurrencies[0]}.`
-      );
-    }
-
-    // Cross-check with template
-    const templateCurrencies = templateText.match(currencyRegex);
-    if (templateCurrencies) {
-      const templateCurr = [...new Set(templateCurrencies.map((c) => c.toUpperCase()))];
-      if (templateCurr.length > 0 && templateCurr[0] !== uniqueCurrencies[0]) {
-        addFinding(
-          "Logical Validation",
-          "currency_template_match",
-          "Currency vs Template",
-          "FAIL",
-          `BG currency (${uniqueCurrencies[0]}) differs from template currency (${templateCurr[0]}). This is likely an error.`
-        );
-      }
-    }
-  }
-
-  /* ================================================================
-     13. BG TYPE DETECTION
-     ================================================================ */
-
-  const bgTypePatterns = [
-    /(?:performance|financial|advance\s+payment|bid\s+bank\s+guarantee|retention|shipping|warranty|defective\s+corrective)/gi,
-  ];
-
-  const detectedTypes: string[] = [];
-  for (const pat of bgTypePatterns) {
-    const matches = bgText.match(pat);
-    if (matches) {
-      detectedTypes.push(...matches.map((m) => m.trim()));
-    }
-  }
-
-  if (detectedTypes.length > 0) {
-    const uniqueTypes = [...new Set(detectedTypes.map((t) => t.toLowerCase()))];
-    addFinding(
-      "Logical Validation",
-      "bg_type",
-      "Bank Guarantee Type",
-      "INFO",
-      `Detected guarantee type(s): ${uniqueTypes.join(", ")}.`
-    );
-
-    // Cross-check with template
-    const templateTypes: string[] = [];
-    for (const pat of bgTypePatterns) {
-      const matches = templateText.match(pat);
-      if (matches) {
-        templateTypes.push(...matches.map((m) => m.trim().toLowerCase()));
-      }
-    }
-    if (templateTypes.length > 0) {
-      const typeOverlap = uniqueTypes.filter((t) => templateTypes.includes(t));
-      if (typeOverlap.length > 0) {
-        addFinding(
-          "Logical Validation",
-          "bg_type_template",
-          "BG Type vs Template",
-          "PASS",
-          `BG type (${typeOverlap.join(", ")}) matches the template type.`
-        );
-      } else {
-        addFinding(
-          "Logical Validation",
-          "bg_type_template",
-          "BG Type vs Template",
-          "REVIEW",
-          `BG type (${uniqueTypes.join(", ")}) differs from template type (${templateTypes.join(", ")}). Verify this is intentional.`
-        );
-      }
-    }
-  }
-
-  /* ================================================================
-     14. SIGNATURE / AUTHORIZATION INDICATORS
-     ================================================================ */
-
-  const signatureTerms = [
-    "authorized signatory",
-    "authorised signatory",
-    "authorized signatories",
-    "authorised signatories",
-    "signed by",
-    "signature",
-    "duly authorised",
-    "duly authorized",
-    "signatory",
-    "signing authority",
-    "name and designation",
-    "authorized signatory for",
-    "for and on behalf of",
-  ];
-
-  const hasSignature = signatureTerms.some((term) => bgLower.includes(term));
-
-  if (hasSignature) {
-    // Try to find which page the signature text is on
-    let sigPage = 0;
-    for (const page of bgPages) {
-      const pageLower = page.text.toLowerCase();
-      if (signatureTerms.some((term) => pageLower.includes(term))) {
-        sigPage = page.pageNumber;
-        break;
-      }
-    }
-
-    addFinding(
-      "Document Validation",
-      "signature_indicators",
-      "Signature / Authorization Indicators",
-      "PASS",
-      "Signature or authorization indicators detected in the document.",
-      sigPage > 0 ? sigPage : undefined
-    );
-  } else {
-    addFinding(
-      "Document Validation",
-      "signature_indicators",
-      "Signature / Authorization Indicators",
-      "REVIEW",
-      "No explicit signature or authorization indicators found. Manual verification required."
-    );
-  }
-
-  /* ================================================================
-     15. STAMP / E-STAMP INDICATORS
-     ================================================================ */
-
-  const stampTerms = [
-    "stamp",
-    "e-stamp",
-    "estamp",
-    "revenue stamp",
-    "stamp duty",
-    "duty paid",
-    "stamped",
-  ];
-
-  const hasStamp = stampTerms.some((term) => bgLower.includes(term));
-
-  if (hasStamp) {
-    addFinding(
-      "Document Validation",
-      "stamp_indicators",
-      "Stamp / E-Stamp Indicators",
-      "PASS",
-      "Stamp or e-stamp indicators detected in the document."
-    );
-  } else {
-    addFinding(
-      "Document Validation",
-      "stamp_indicators",
-      "Stamp / E-Stamp Indicators",
-      "INFO",
-      "No stamp indicators found. Stamps may not be required for all BG types or jurisdictions."
-    );
-  }
-
-  /* ================================================================
-     16. ADDRESS / CONTACT FIELD DETECTION
-     ================================================================ */
-
-  const addressPatterns = [
-    /(?:address|registered\s+office|corporate\s+office|branch\s+office)\s*[:.]?\s*(.+?)(?:\n|$)/gi,
-  ];
-  const bgAddress = extractField(bgText, addressPatterns);
-
-  if (bgAddress && bgAddress.length > 10) {
-    addFinding(
-      "Document Validation",
-      "address_detected",
-      "Address Information",
-      "INFO",
-      `Address detected in the document: "${bgAddress.substring(0, 120)}${bgAddress.length > 120 ? "…" : ""}"`,
-      undefined,
-      bgAddress.substring(0, 120)
-    );
-  }
-
-  /* ================================================================
-     17. DOCUMENT TEXT QUALITY
-     ================================================================ */
-
-  const wordCount = bgText.split(/\s+/).filter((w) => w.length > 0).length;
-  const charCount = bgText.replace(/\s/g, "").length;
-
-  if (wordCount < 30 || charCount < 100) {
-    addFinding(
-      "Document Validation",
-      "low_text_quality",
-      "Document Text Quality",
-      "FAIL",
-      `Only ${wordCount} words (${charCount} characters) extracted. The document may be corrupted, empty, or require better OCR processing.`
-    );
-  } else if (wordCount < 100) {
-    addFinding(
-      "Document Validation",
-      "low_text_quality",
-      "Document Text Quality",
-      "REVIEW",
-      `Only ${wordCount} words extracted. Some content may be missing or difficult to extract. Check the extracted text for completeness.`
-    );
-  } else {
-    addFinding(
-      "Document Validation",
-      "low_text_quality",
-      "Document Text Quality",
-      "PASS",
-      `Document contains ${wordCount} words. Text extraction appears successful.`
-    );
-  }
-
-  /* ================================================================
-     18. SCANNED DOCUMENT QUALITY CHECKS
-     ================================================================ */
-
-  // Check if any pages are scanned and report per-page quality
-  const scannedPages = bgPages.filter((p) => p.isScanned === true);
-  if (scannedPages.length > 0) {
-    addFinding(
-      "Document Validation",
-      "scanned_pages",
-      "Scanned Pages Detected",
-      "INFO",
-      `${scannedPages.length} of ${bgPages.length} page(s) were detected as scanned and processed via OCR. Results may vary depending on scan quality.`
-    );
-
-    // Report per-page low-confidence OCR
-    for (const page of scannedPages) {
-      if (page.confidence != null && page.confidence < 0.5) {
-        addFinding(
-          "Document Validation",
-          `page_quality_${page.pageNumber}`,
-          `Page ${page.pageNumber} — Low OCR Confidence`,
-          "REVIEW",
-          `Page ${page.pageNumber} had low OCR confidence (${Math.round(page.confidence * 100)}%). The extracted text on this page may contain errors.`,
-          page.pageNumber
-        );
-      }
-    }
-  }
-
-  // Check for garbled / OCR artifact patterns
-  const garbledPatterns = bgText.match(/[^\x00-\x7F]{5,}/g);
-  if (garbledPatterns && garbledPatterns.length > 3) {
-    addFinding(
-      "Document Validation",
-      "garbled_text",
-      "Garbled Text Detected",
-      "REVIEW",
-      `${garbledPatterns.length} garbled text sequences found. These may be OCR artifacts or encoding issues from scanned documents.`
-    );
-  }
-
-  /* ================================================================
-     19. LAYOUT STRUCTURE CHECKS
-     ================================================================ */
-
-  const hasTitle = bgLower.includes("bank guarantee") || bgLower.includes("guarantee");
-  const hasParties =
-    bgLower.includes("beneficiary") ||
-    bgLower.includes("applicant") ||
-    bgLower.includes("principal");
-  const hasAmount = amounts.length > 0;
-  const hasDates = allDates.length > 0;
-  const hasTerms =
-    bgLower.includes("terms and conditions") ||
-    bgLower.includes("conditions") ||
-    bgLower.includes("terms of");
-
-  const structureElements = [
-    hasTitle && "title",
-    hasParties && "parties",
-    hasAmount && "amount",
-    hasDates && "dates",
-    hasTerms && "terms",
-  ].filter(Boolean);
-
-  const structureScore = structureElements.length / 5;
-
-  if (structureScore >= 0.8) {
-    addFinding(
-      "Document Validation",
-      "structure_check",
-      "Document Structure",
-      "PASS",
-      `Document structure appears complete (${structureElements.join(", ")}).`
-    );
-  } else if (structureScore >= 0.4) {
-    addFinding(
-      "Document Validation",
-      "structure_check",
-      "Document Structure",
-      "REVIEW",
-      `Only ${structureElements.length} of 5 key structural elements detected (${structureElements.join(", ")}). Some elements may be missing or use non-standard formatting.`
-    );
-  } else {
-    addFinding(
-      "Document Validation",
-      "structure_check",
-      "Document Structure",
-      "FAIL",
-      `Only ${structureElements.length} of 5 key structural elements found. The document may not be a valid Bank Guarantee.`
-    );
-  }
-
-  /* ================================================================
-     20. MUTUAL CONSENT / AMENDMENT CLAUSE
-     ================================================================ */
-
-  const hasMutualConsent =
-    bgLower.includes("mutual consent") ||
-    bgLower.includes("without the consent") ||
-    bgLower.includes("amendment");
-
-  if (hasMutualConsent) {
-    addFinding(
-      "Logical Validation",
-      "amendment_clause",
-      "Amendment / Consent Clause",
-      "PASS",
-      "Amendment or mutual consent clause detected. The guarantee cannot be modified without agreement."
-    );
-  }
-
-  /* ================================================================
-     21. GOVERNING LAW / JURISDICTION
-     ================================================================ */
-
-  const governingLawPatterns = [
-    /(?:governing\s+law|subject\s+to|jurisdiction|laws?\s+of)\s*[:.]?\s*(.+?)(?:\n|$)/gi,
-  ];
-  const governingLaw = extractField(bgText, governingLawPatterns);
-
-  if (governingLaw) {
-    addFinding(
-      "Logical Validation",
-      "governing_law",
-      "Governing Law / Jurisdiction",
-      "PASS",
-      `Governing law or jurisdiction clause detected: "${governingLaw.substring(0, 100)}"`,
-      undefined,
-      governingLaw.substring(0, 100)
-    );
-  }
-
-  /* ================================================================
-     22. OPTIONAL / BANK-SPECIFIC INFORMATION (INFO only, never FAIL)
-     ================================================================ */
-
-  // IFSC Code
-  const ifscMatch = bgText.match(/\b([A-Z]{4}0[A-Z0-9]{6})\b/);
-  if (ifscMatch) {
-    addFinding(
-      "Optional Information",
-      "ifsc_code",
-      "IFSC Code",
-      "INFO",
-      `IFSC code detected: ${ifscMatch[1]}. This is additional bank-specific information.`,
-      undefined,
-      ifscMatch[1]
-    );
-  }
-
-  // SWIFT/BIC Code (more precise pattern)
-  const swiftMatch = bgText.match(/\b([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b/);
-  if (swiftMatch) {
-    const swift = swiftMatch[1];
-    const exclusions = [
-      "ACCOUNT", "ADDRESS", "COMPANY", "GUARANTEE", "BENEFICIARY",
-      "APPLICANT", "BANKING", "CHARGES", "CUSTOMER", "DETAILS",
-      "DOCUMENT", "FINANCE", "GUARANTEE", "INDICATE", "ISSUANCE",
-      "LETTERS", "MENTION", "NOMINAL", "ORIGINAL", "PAYMENT",
-      "REQUIRE", "SECTION", "TARIFF", "UNIQUE", "VARIANCE",
-    ];
-    if (!exclusions.includes(swift)) {
-      addFinding(
-        "Optional Information",
-        "swift_code",
-        "SWIFT / BIC Code",
-        "INFO",
-        `SWIFT/BIC code detected: ${swift}. This is additional bank-specific information.`,
-        undefined,
-        swift
-      );
-    }
-  }
-
-  // Branch information
-  const branchMatch = bgText.match(/branch\s*[:.]?\s*(.+?)(?:\n|$)/i);
-  if (branchMatch) {
-    addFinding(
-      "Optional Information",
-      "branch_info",
-      "Branch Information",
-      "INFO",
-      `Branch information detected: ${branchMatch[1].trim().substring(0, 100)}`,
-      undefined,
-      branchMatch[1].trim().substring(0, 100)
-    );
-  }
-
-  // Email address
-  const emailMatch = bgText.match(/[\w.-]+@[\w.-]+\.[A-Za-z]{2,}/);
-  if (emailMatch) {
-    addFinding(
-      "Optional Information",
-      "email",
-      "Email Contact",
-      "INFO",
-      `Email address detected: ${emailMatch[0]}`,
-      undefined,
-      emailMatch[0]
-    );
-  }
-
-  // Phone number (more precise)
-  const phoneMatch = bgText.match(/(?:\+91[\s-]?)?0?\d{10}\b/);
-  if (phoneMatch) {
-    addFinding(
-      "Optional Information",
-      "phone",
-      "Phone Contact",
-      "INFO",
-      `Phone number detected: ${phoneMatch[0]}`,
-      undefined,
-      phoneMatch[0]
-    );
-  }
-
-  // GST / PAN / TAN numbers
-  const gstMatch = bgText.match(/\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z\d]\b/);
-  if (gstMatch) {
-    addFinding(
-      "Optional Information",
-      "gst_number",
-      "GST Number",
-      "INFO",
-      `GST number detected: ${gstMatch[0]}`,
-      undefined,
-      gstMatch[0]
-    );
-  }
-
-  const panMatch = bgText.match(/\b[A-Z]{5}\d{4}[A-Z]\b/);
-  if (panMatch) {
-    addFinding(
-      "Optional Information",
-      "pan_number",
-      "PAN Number",
-      "INFO",
-      `PAN number detected: ${panMatch[0]}`,
-      undefined,
-      panMatch[0]
-    );
-  }
-
-  /* ================================================================
-     RETURN
-     ================================================================ */
 
   return findings;
 }
 
-/* ──────────────────────────────────────────────────────────────
+/* ================================================================
    COMPUTE OVERALL RESULT
-   ────────────────────────────────────────────────────────────── */
+   ================================================================ */
 
 export function computeResult(
   findings: ValidationFinding[],
   documentType: string,
   pageCount: number,
-  extractedText: string
+  extractedText: string,
 ): ValidationResult {
   const passCount = findings.filter((f) => f.status === "PASS").length;
   const reviewCount = findings.filter((f) => f.status === "REVIEW").length;
@@ -1366,11 +1190,8 @@ export function computeResult(
   const infoCount = findings.filter((f) => f.status === "INFO").length;
 
   let status: "VALID" | "REVIEW" | "DISCREPANT" = "VALID";
-  if (failCount > 0) {
-    status = "DISCREPANT";
-  } else if (reviewCount > 0) {
-    status = "REVIEW";
-  }
+  if (failCount > 0) status = "DISCREPANT";
+  else if (reviewCount > 0) status = "REVIEW";
 
   return {
     documentType: documentType as any,

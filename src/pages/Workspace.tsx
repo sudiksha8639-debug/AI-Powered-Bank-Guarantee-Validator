@@ -134,6 +134,7 @@ export default function Workspace() {
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [selectedFinding, setSelectedFinding] = useState<ValidationFinding | null>(null);
+  const [userInstructions, setUserInstructions] = useState("");
 
   const filteredFindings = resultData?.findings.filter((f) => {
     if (categoryFilter !== "all" && f.category !== categoryFilter) return false;
@@ -236,7 +237,7 @@ export default function Workspace() {
         const templateText = templateData?.extractedText ?? "";
         const templateClauses = templateData?.clauses ?? [];
 
-        const findings = validateBg(templateClauses, templateText, fullText, pages);
+        const findings = validateBg(templateClauses, templateText, fullText, pages, userInstructions || undefined);
         const result = computeResult(findings, documentType, pages.length, fullText);
 
         setStage("report");
@@ -253,6 +254,7 @@ export default function Workspace() {
           failCount: result.failCount,
           infoCount: result.infoCount,
           extractedText: fullText,
+          userInstructions: userInstructions || undefined,
           findings: findings.map((f) => ({
             category: f.category,
             checkId: f.checkId,
@@ -306,6 +308,7 @@ export default function Workspace() {
       bgFile.name,
       selectedTemplateName,
       format(new Date(), "PPP"),
+      userInstructions || undefined,
     );
   };
 
@@ -483,6 +486,31 @@ export default function Workspace() {
                 <Button variant="ghost" size="sm" onClick={() => setStep("template")} className="text-emerald-700 hover:text-emerald-800 hover:bg-emerald-100 gap-1.5 rounded-lg text-xs">
                   <ArrowLeft className="h-3 w-3" />Change
                 </Button>
+              </div>
+            </div>
+
+            {/* User Instructions */}
+            <div className="rounded-2xl border border-border/60 bg-card shadow-sm overflow-hidden">
+              <div className="border-b border-border/40 bg-muted/20 px-7 py-5">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                    <FileText className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-semibold text-foreground">Additional Validation Instructions</h2>
+                    <p className="text-xs text-muted-foreground mt-0.5">Optionally provide extra requirements or context to supplement the automated checks.</p>
+                  </div>
+                </div>
+              </div>
+              <div className="px-7 py-5">
+                <textarea
+                  value={userInstructions}
+                  onChange={(e) => setUserInstructions(e.target.value)}
+                  placeholder="e.g. Ensure the BG amount matches the contract value. Verify the issuing bank is an approved institution. Check that the beneficiary name matches the project partner."
+                  className="w-full rounded-xl border border-border/60 bg-background px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/40 resize-none"
+                  rows={3}
+                />
+                <p className="mt-2 text-[11px] text-muted-foreground/60">Separate multiple instructions with semicolons. These instructions will appear in the validation report but do not override the core validation engine.</p>
               </div>
             </div>
 

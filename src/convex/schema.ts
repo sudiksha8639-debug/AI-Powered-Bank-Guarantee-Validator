@@ -55,6 +55,7 @@ const schema = defineSchema(
       failCount: v.number(),
       infoCount: v.number(),
       extractedText: v.string(),
+      userInstructions: v.optional(v.string()),
       createdAt: v.number(),
     }).index("by_user", ["userId"]),
 

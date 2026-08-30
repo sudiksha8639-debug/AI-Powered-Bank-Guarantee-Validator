@@ -50,6 +50,7 @@ export function generateReport(
   filename: string,
   templateName: string,
   date: string,
+  userInstructions?: string,
 ) {
   const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
   const pageW = doc.internal.pageSize.getWidth();
@@ -94,7 +95,20 @@ export function generateReport(
   doc.text(`Template: ${templateName}`, margin, y);
   y += 5;
   doc.text(`Type: ${result.documentType}  |  Pages: ${result.pageCount}`, margin, y);
-  y += 10;
+  y += 8;
+
+  if (userInstructions) {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.text("USER INSTRUCTIONS:", margin, y);
+    y += 5;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    const lines = doc.splitTextToSize(userInstructions, contentW);
+    doc.text(lines, margin, y);
+    y += lines.length * 4 + 4;
+  }
+  y += 4;
 
   /* ─── Overall verdict ─── */
   const verdictColor =

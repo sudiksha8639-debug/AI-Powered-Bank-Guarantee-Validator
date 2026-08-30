@@ -14,6 +14,7 @@ export const create = mutation({
     failCount: v.number(),
     infoCount: v.number(),
     extractedText: v.string(),
+    userInstructions: v.optional(v.string()),
     findings: v.array(
       v.object({
         category: v.string(),
@@ -48,6 +49,7 @@ export const create = mutation({
       failCount: args.failCount,
       infoCount: args.infoCount,
       extractedText: args.extractedText,
+      userInstructions: args.userInstructions,
       createdAt: Date.now(),
     });
 

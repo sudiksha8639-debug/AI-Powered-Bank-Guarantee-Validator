@@ -109,6 +109,7 @@ export default function Results() {
       validation.filename,
       validation.filename,
       format(validation.createdAt, "PPP"),
+      validation.userInstructions || undefined,
     );
   };
 
@@ -194,6 +195,18 @@ export default function Results() {
             </div>
           </div>
         </div>
+
+        {validation.userInstructions && (
+          <div className="mb-5 rounded-xl border border-primary/20 bg-primary/[0.04] px-5 py-4">
+            <div className="flex items-start gap-2.5">
+              <Info className="h-4 w-4 text-primary mt-0.5 shrink-0" />
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wider text-primary">Additional Instructions</p>
+                <p className="mt-1 text-sm text-foreground/80">{validation.userInstructions}</p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Split View */}
         <ResizablePanelGroup direction="horizontal" className="rounded-xl border border-border/60 bg-card shadow-sm min-h-[600px]">
